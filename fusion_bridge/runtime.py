@@ -9,9 +9,12 @@ import adsk.core
 
 from .. import settings
 from ..lib import mcp_server as mcp_server_module
+from ..lib.request_admission import GenerationUnchangedError
 from . import doc_lookup, python_exec, tool_surface
+from .admission_runtime import AdmissionRuntime
 from .dispatch import (
-    dispatch_to_main_thread,
+    bind_dispatch,
+    defer_main_thread_retirement,
     drain_logs,
     format_duration,
     get_shutdown_flag,
@@ -25,7 +28,9 @@ from .dispatch import (
 
 
 _server = None
+_admission = None
 _server_lock = threading.Lock()
+_host_stop = None
 
 
 def handle_any_tool(call_data):
@@ -58,7 +63,7 @@ def handle_any_tool(call_data):
         log(f"[MCP] {tool_name} {status} in {format_duration(elapsed_ms)}")
 
 
-def create_server():
+def create_server(dispatch, *, admission_api=None):
     from . import operations
 
     set_tool_handler(handle_any_tool)
@@ -67,9 +72,10 @@ def create_server():
         port=settings.MCP_SERVER_PORT,
         tools=tool_surface.TOOL_DEFINITIONS,
         tool_handlers={
-            name: dispatch_to_main_thread for name in operations.TOOL_HANDLERS
+            name: dispatch for name in operations.TOOL_HANDLERS
         },
         log_callback=log,
+        admission_api=admission_api,
     )
 
     server.resources.append(
@@ -92,8 +98,8 @@ def create_server():
     return server
 
 
-def _start_server():
-    global _server
+def _start_server(shutdown_flag):
+    global _server, _admission
 
     if _server and _server.is_running:
         log("MCP server already running")
@@ -101,11 +107,27 @@ def _start_server():
 
     log(f"Starting MCP server on port {settings.MCP_SERVER_PORT}...")
     attempt = 0
-    shutdown_flag = get_shutdown_flag()
+    dispatch = bind_dispatch(shutdown_flag)
+    admission = AdmissionRuntime.from_environment(dispatch, shutdown=shutdown_flag)
+    try:
+        server = create_server(dispatch, admission_api=admission.http if admission else None)
+    except BaseException:
+        if admission is not None:
+            admission.close()
+        raise
+    try:
+        return _listen(server, admission, shutdown_flag, attempt)
+    finally:
+        if admission is not None and _admission is not admission:
+            admission.close()
+
+
+def _listen(server, admission, shutdown_flag, attempt):
+    global _server, _admission
     while not shutdown_flag.is_set():
         try:
-            _server = create_server()
-            _server.start()
+            server.start()
+            _server, _admission = server, admission
             break
         except OSError as exc:
             if "Address already in use" not in str(exc):
@@ -154,18 +176,19 @@ def _server_start_worker(shutdown_flag=None):
         if shutdown_flag.is_set():
             return
         try:
-            if not _start_server():
-                request_main_thread_shutdown()
+            if not _start_server(shutdown_flag):
+                request_main_thread_shutdown(shutdown_flag)
         except Exception as exc:
             log(
                 f"ERROR: Failed to start MCP server: {exc}",
                 adsk.core.LogLevels.ErrorLogLevel,
             )
             log(traceback.format_exc(), adsk.core.LogLevels.ErrorLogLevel)
-            request_main_thread_shutdown()
+            request_main_thread_shutdown(shutdown_flag)
 
 
 def start():
+    _require_main_thread()
     version_info = python_exec.get_version_info(python_exec.get_addin_dir())
     log(f"MCP Integration starting... add-in {version_info}")
     fusion_version = getattr(adsk.core.Application.get(), "version", "unknown")
@@ -207,17 +230,87 @@ def start():
     return True
 
 
-def stop():
-    global _server
+def _require_main_thread():
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError("Fusion runtime lifecycle requires the main thread")
 
-    log("MCP Integration stopping...")
-    # Also releases any pending readiness wait inside _server_start_worker.
-    stop_main_thread_dispatch()
 
-    with _server_lock:
-        if _server:
-            _server.stop()
-            _server = None
+def _seal():
+    if _admission:
+        _admission.http.begin_quiescence()
+    if not request_main_thread_shutdown():
+        return False
+    return _admission is None or _admission.http.seal_if_idle()
 
+
+def _retire():
+    global _server, _admission
+
+    if not stop_main_thread_dispatch():
+        raise RuntimeError("Dispatch became active during retirement")
+    if _server:
+        _server.stop()
+        _server = None
+    if _admission:
+        _admission.close()
+        _admission = None
+
+
+def handoff_admission_generation(*, instance, epoch):
+    """Explicit trusted handoff; False means retry after outstanding work settles."""
+    _require_main_thread()
+    if _admission is None:
+        raise RuntimeError("No admission runtime to hand off")
+    if _host_stop is not None or not _seal():
+        return False
+    if not _server_lock.acquire(blocking=False):
+        return False
+    try:
+        try:
+            _admission.advance_generation(instance=instance, epoch=epoch)
+        except GenerationUnchangedError:
+            _admission.http.restore_recovery()
+            raise
+        _retire()
+    finally:
+        _server_lock.release()
+    return True
+
+
+def _finish_host_stop():
+    global _host_stop
+    if _host_stop is None:
+        return True
+    if not _seal():
+        return False
+    if not _server_lock.acquire(blocking=False):
+        return False
+    try:
+        # A cold-start worker may have published a listener after the
+        # first seal attempt. Its own shutdown flag already fences admit.
+        if not _seal():
+            return False
+        _retire()
+        (on_retired,) = _host_stop
+        _host_stop = None
+    finally:
+        _server_lock.release()
     log("MCP Integration stopped")
     drain_logs()
+    if on_retired is not None:
+        on_retired()
+    return True
+
+
+def stop(*, on_retired=None):
+    _require_main_thread()
+    global _host_stop
+    if _host_stop is not None:
+        return False
+    log("MCP Integration stopping...")
+    _host_stop = (on_retired,)
+    if _finish_host_stop():
+        return True
+    defer_main_thread_retirement(_finish_host_stop)
+    log("MCP Integration still quiescing; retirement deferred")
+    return False

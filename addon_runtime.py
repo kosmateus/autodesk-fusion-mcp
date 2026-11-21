@@ -23,11 +23,17 @@ def run(context):
 
 def stop(context):
     del context
+
+    def retired():
+        try:
+            commands.stop()
+            futil.clear_handlers()
+            fusion_runtime.log("[OK] Autodesk Fusion MCP stopped")
+        except Exception:
+            futil.handle_error("stop")
+
     try:
         fusion_runtime.log("Autodesk Fusion MCP stopping...")
-        fusion_runtime.stop()
-        commands.stop()
-        futil.clear_handlers()
-        fusion_runtime.log("[OK] Autodesk Fusion MCP stopped")
+        fusion_runtime.stop(on_retired=retired)
     except Exception:
         futil.handle_error("stop")

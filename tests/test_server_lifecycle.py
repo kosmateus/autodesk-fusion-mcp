@@ -304,19 +304,20 @@ class ServerLifecycleTests(unittest.TestCase):
 
     def test_submission_racing_with_stop_cannot_execute_after_restart(self):
         entered, release = threading.Event(), threading.Event()
-        original_put = dispatch._pending.put
+        new_envelope = dispatch._new_envelope
         result = []
 
-        def delayed_put(envelope):
+        def delayed_envelope(data, reply):
+            # Pause the old submission before the atomic intake gate.
             entered.set()
             release.wait(5)
-            original_put(envelope)
+            return new_envelope(data, reply)
 
         app = dispatch.get_app()
         with mock.patch.object(dispatch, "get_app", return_value=app), \
                 mock.patch.object(app, "fireCustomEvent", side_effect=lambda _: dispatch._flush_pending()), \
                 mock.patch.object(dispatch, "_schedule_tick"), \
-                mock.patch.object(dispatch._pending, "put", delayed_put), \
+                mock.patch.object(dispatch, "_new_envelope", delayed_envelope), \
                 mock.patch.object(dispatch, "_callback_impl") as tool:
             worker = threading.Thread(target=lambda: result.append(
                 dispatch.dispatch_to_main_thread({"params": {"name": "echo"},
@@ -324,7 +325,7 @@ class ServerLifecycleTests(unittest.TestCase):
             worker.start()
             try:
                 self.assertTrue(entered.wait(2))
-                runtime.stop()
+                self.assertTrue(runtime.stop())
                 dispatch.init_main_thread_dispatch()
             finally:
                 release.set()
