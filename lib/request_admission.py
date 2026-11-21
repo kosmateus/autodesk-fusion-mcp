@@ -42,6 +42,17 @@ class AdmissionStore:
                     ), claim TEXT, result TEXT
                 )
             """)
+            with self._transaction():
+                self._db.execute("""
+                    CREATE TABLE IF NOT EXISTS generation (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton=1),
+                        instance TEXT NOT NULL, epoch TEXT NOT NULL
+                    )
+                """)
+                self._db.execute(
+                    "INSERT OR REPLACE INTO generation VALUES (1,?,?)",
+                    (instance, epoch),
+                )
         except BaseException:
             self._db.close()
             raise
@@ -86,6 +97,11 @@ class AdmissionStore:
                 raise
 
     def _read(self, binding, encoded):
+        generation = self._db.execute(
+            "SELECT instance,epoch FROM generation WHERE singleton=1"
+        ).fetchone()
+        if generation != (self._instance, self._epoch):
+            raise AdmissionError("Receiver generation is no longer current")
         row = self._db.execute(
             "SELECT binding,state,claim,result FROM admissions WHERE request=?",
             (binding["request"],),
@@ -111,14 +127,19 @@ class AdmissionStore:
             return self._public(self._read(binding, encoded))
 
     def admit(self, binding):
+        return self.admit_once(binding)[0]
+
+    def admit_once(self, binding):
+        """Only the transaction creating the admission may schedule its callback."""
         encoded = self._binding(binding)
         with self._transaction():
-            if self._read(binding, encoded) is None:
+            created = self._read(binding, encoded) is None
+            if created:
                 self._db.execute(
                     "INSERT INTO admissions(request,binding,state) VALUES (?,?,'accepted')",
                     (binding["request"], encoded),
                 )
-            return self._public(self._read(binding, encoded))
+            return self._public(self._read(binding, encoded)), created
 
     def withdraw(self, binding):
         encoded = self._binding(binding)

@@ -19,7 +19,11 @@ class ReceiverContracts(unittest.TestCase):
         self.store = AdmissionStore(str(Path(self.tmp.name) / "state.db"),
                                     instance="server", epoch="epoch")
         self.addCleanup(self.store.close)
-        self.receiver = AdmissionReceiver(self.store, source="source", build="build")
+        self.target_document = "doc"
+        self.receiver = AdmissionReceiver(
+            self.store, source="source", build="build",
+            resolve_document=lambda payload: self.target_document,
+        )
         self.payload = {"name": "execute", "arguments": {"code": "original"}}
         digest = hashlib.sha256(json.dumps(
             self.payload, sort_keys=True, separators=(",", ":"),
@@ -39,7 +43,7 @@ class ReceiverContracts(unittest.TestCase):
             return {"ok": True}
 
         self.assertEqual(first(handler)["state"], "terminal")
-        self.assertEqual(second(handler)["state"], "terminal")
+        self.assertIsNone(second)
         self.assertEqual(effects, ["original"])
 
     def test_withdrawal_wins_before_delayed_consumer(self):
@@ -76,6 +80,25 @@ class ReceiverContracts(unittest.TestCase):
         self.assertEqual(record["state"], "unknown")
         self.assertIsNone(retry)
         self.assertEqual(len(effects), 1)
+
+    def test_document_change_before_consumption_prevents_effect(self):
+        _, consumer = self.receiver.prepare("owner", self.binding, self.payload)
+        self.target_document = "another-document"
+        effects = []
+        with self.assertRaisesRegex(AdmissionError, "document mismatch"):
+            consumer(lambda payload: effects.append(payload))
+        self.assertEqual(effects, [])
+
+    def test_new_generation_invalidates_old_prepared_consumer(self):
+        _, consumer = self.receiver.prepare("owner", self.binding, self.payload)
+        replacement = AdmissionStore(
+            str(Path(self.tmp.name) / "state.db"), instance="server", epoch="new",
+        )
+        self.addCleanup(replacement.close)
+        effects = []
+        with self.assertRaisesRegex(AdmissionError, "generation"):
+            consumer(lambda payload: effects.append(payload))
+        self.assertEqual(effects, [])
 
 
 if __name__ == "__main__":

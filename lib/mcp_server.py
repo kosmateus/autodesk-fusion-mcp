@@ -281,6 +281,7 @@ class MCPServer:
 
             def _handle_admission_post(self):
                 from .request_admission import AdmissionError
+                from .admission_http import AdmissionCapacityError
 
                 try:
                     principal = server_ref.admission_api.authenticate(
@@ -292,6 +293,9 @@ class MCPServer:
                 lengths = self.headers.get_all("Content-Length", [])
                 if (self.headers.get_all("Transfer-Encoding", [])
                         or len(lengths) != 1 or not lengths[0].isdigit()):
+                    self._send_empty(400, close=True)
+                    return
+                if len(lengths[0]) > 10 or not lengths[0].isascii():
                     self._send_empty(400, close=True)
                     return
                 size = int(lengths[0])
@@ -315,6 +319,9 @@ class MCPServer:
                         raise ValueError("Non-JSON constant")
                     message = json.loads(body.decode("utf-8"), parse_constant=reject_constant)
                     result = server_ref.admission_api.handle(principal, message)
+                except AdmissionCapacityError:
+                    self._send_empty(503, close=True)
+                    return
                 except (AdmissionError, ValueError, UnicodeError):
                     self._send_empty(400, close=True)
                     return
