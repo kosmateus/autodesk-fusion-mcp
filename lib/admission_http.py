@@ -75,8 +75,13 @@ class AdmissionHTTP:
                 timer.start()
                 # Local lifecycle metadata is not part of the admitted payload.
                 # The consumer passes its frozen original to the SDK handler.
-                self._dispatch(dict(payload, _cancel_event=cancelled),
-                               admission_consumer=consumer)
+                try:
+                    self._dispatch(dict(payload, _cancel_event=cancelled),
+                                   admission_consumer=consumer)
+                except Exception as exc:
+                    # Adapter failures are not malformed client input, even
+                    # when their Python exception happens to be ValueError.
+                    raise RuntimeError("Admission dispatch failed") from exc
                 # Dispatch can translate exceptions into a legacy MCP error.
                 # Only the durable receiver determines the outcome.
                 return self._receiver.status(principal, binding)

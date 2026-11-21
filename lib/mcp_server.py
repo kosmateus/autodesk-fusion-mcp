@@ -304,8 +304,20 @@ class MCPServer:
                     return
                 old_timeout = self.connection.gettimeout()
                 try:
-                    self.connection.settimeout(10)
-                    body = self.rfile.read(size)
+                    deadline = time.monotonic() + 10
+                    chunks = []
+                    remaining = size
+                    while remaining:
+                        budget = deadline - time.monotonic()
+                        if budget <= 0:
+                            raise TimeoutError("Admission body deadline exceeded")
+                        self.connection.settimeout(budget)
+                        chunk = self.rfile.read1(min(remaining, 65536))
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        remaining -= len(chunk)
+                    body = b"".join(chunks)
                     if len(body) != size:
                         self._send_empty(400, close=True)
                         return

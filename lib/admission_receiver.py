@@ -53,7 +53,7 @@ class AdmissionReceiver:
             return record, None
 
         def consume(handler):
-            if self._resolve_document(frozen_payload) != frozen_binding["document"]:
+            if self._resolve_document(json.loads(encoded)) != frozen_binding["document"]:
                 raise AdmissionError("Execution document mismatch")
             if not self._store.claim(frozen_binding):
                 return self._store.status(frozen_binding)

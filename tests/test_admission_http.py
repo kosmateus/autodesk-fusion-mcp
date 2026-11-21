@@ -72,7 +72,7 @@ class AdmissionHTTPContracts(HTTPFixture, unittest.TestCase):
     def test_exception_after_effect_remains_unknown_without_retry(self):
         def interrupted(payload):
             self.effects.append(payload)
-            raise RuntimeError("Effect occurred without terminal receipt")
+            raise ValueError("Effect occurred without terminal receipt")
 
         self.execute = interrupted
         self.assertEqual(self.request("admit", token=self.token)[0], 500)
@@ -165,6 +165,9 @@ class AdmissionHTTPContracts(HTTPFixture, unittest.TestCase):
         self.addCleanup(dispatch.set_tool_handler, None)
         dispatch._BridgeEventHandler().notify(None)
         self.assertEqual(self.effects, [])
+        withdrawn = self.request("withdraw", token=self.token)
+        self.assertEqual(withdrawn[1]["record"]["state"], "withdrawn")
+        self.assertEqual(self.request("admit", token=self.token), withdrawn)
 
     def test_capacity_refuses_new_admission_but_allows_status(self):
         entered = threading.Event()

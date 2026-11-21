@@ -49,10 +49,21 @@ class AdmissionStore:
                         instance TEXT NOT NULL, epoch TEXT NOT NULL
                     )
                 """)
-                self._db.execute(
-                    "INSERT OR REPLACE INTO generation VALUES (1,?,?)",
-                    (instance, epoch),
-                )
+                self._db.execute("INSERT OR IGNORE INTO generation VALUES (1,?,?)",
+                                 (instance, epoch))
+                current = self._db.execute(
+                    "SELECT instance,epoch FROM generation WHERE singleton=1"
+                ).fetchone()
+                if current != (instance, epoch):
+                    raise AdmissionError("Opening stale generation is forbidden")
+                self._db.execute("""
+                    CREATE TABLE IF NOT EXISTS generation_history (
+                        instance TEXT NOT NULL, epoch TEXT NOT NULL,
+                        PRIMARY KEY (instance,epoch)
+                    )
+                """)
+                self._db.execute("INSERT OR IGNORE INTO generation_history VALUES (?,?)",
+                                 (instance, epoch))
         except BaseException:
             self._db.close()
             raise
@@ -69,6 +80,35 @@ class AdmissionStore:
                 self._db.close()
                 self._db = None
                 self._claims.clear()
+
+    def advance_generation(self, *, instance, epoch):
+        """Explicit CAS transition by the current runtime after a safe handoff.
+
+        This does not stop active SDK work; bootstrap must quiesce it first.
+        Previous generations can never become current again.
+        """
+        if not all(isinstance(v, str) and v for v in (instance, epoch)):
+            raise AdmissionError("Server instance and epoch are required")
+        with self._transaction():
+            current = self._db.execute(
+                "SELECT instance,epoch FROM generation WHERE singleton=1"
+            ).fetchone()
+            if current != (self._instance, self._epoch):
+                raise AdmissionError("Generation transition lost its fence")
+            if self._db.execute(
+                "SELECT 1 FROM generation_history WHERE instance=? AND epoch=?",
+                (instance, epoch),
+            ).fetchone():
+                raise AdmissionError("Generation reuse is forbidden")
+            self._db.execute("INSERT INTO generation_history VALUES (?,?)",
+                             (instance, epoch))
+            changed = self._db.execute(
+                "UPDATE generation SET instance=?,epoch=? "
+                "WHERE singleton=1 AND instance=? AND epoch=?",
+                (instance, epoch, self._instance, self._epoch),
+            ).rowcount
+            if changed != 1:
+                raise AdmissionError("Generation transition lost its fence")
 
     def _binding(self, binding):
         if not isinstance(binding, dict) or set(binding) != self._FIELDS:

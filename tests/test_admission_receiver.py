@@ -91,6 +91,7 @@ class ReceiverContracts(unittest.TestCase):
 
     def test_new_generation_invalidates_old_prepared_consumer(self):
         _, consumer = self.receiver.prepare("owner", self.binding, self.payload)
+        self.store.advance_generation(instance="server", epoch="new")
         replacement = AdmissionStore(
             str(Path(self.tmp.name) / "state.db"), instance="server", epoch="new",
         )
@@ -99,6 +100,27 @@ class ReceiverContracts(unittest.TestCase):
         with self.assertRaisesRegex(AdmissionError, "generation"):
             consumer(lambda payload: effects.append(payload))
         self.assertEqual(effects, [])
+
+        with self.assertRaisesRegex(AdmissionError, "stale generation"):
+            AdmissionStore(str(Path(self.tmp.name) / "state.db"),
+                           instance="server", epoch="epoch")
+        with self.assertRaisesRegex(AdmissionError, "reuse"):
+            replacement.advance_generation(instance="server", epoch="epoch")
+        with self.assertRaisesRegex(AdmissionError, "generation"):
+            consumer(lambda payload: effects.append(payload))
+        self.assertEqual(effects, [])
+
+    def test_resolver_cannot_mutate_the_admitted_input(self):
+        def resolver(payload):
+            payload["arguments"]["code"] = "tampered"
+            return "doc"
+
+        receiver = AdmissionReceiver(self.store, source="source", build="build",
+                                     resolve_document=resolver)
+        _, consumer = receiver.prepare("owner", self.binding, self.payload)
+        effects = []
+        consumer(lambda payload: effects.append(payload["arguments"]["code"]))
+        self.assertEqual(effects, ["original"])
 
 
 if __name__ == "__main__":
