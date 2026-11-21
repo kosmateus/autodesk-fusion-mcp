@@ -33,15 +33,19 @@ class AdmissionReceiver:
         self._authorize(principal, binding)
         return self._store.withdraw(binding)
 
-    def prepare(self, principal, binding, payload):
+    def prepare(self, principal, binding, payload, *, encoded_payload=None):
         """Return a callback for the shared SDK queue, or no callback for a terminal key.
 
         Only the creator schedules a callback. The durable claim is checked
         at consumption, not at enqueue. Exceptions after claim leave UNKNOWN.
         """
         self._authorize(principal, binding)
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"),
-                             ensure_ascii=True, allow_nan=False)
+        encoded = encoded_payload
+        if encoded is None:
+            encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                                 ensure_ascii=True, allow_nan=False)
+        elif not isinstance(encoded, str) or json.loads(encoded) != payload:
+            raise AdmissionError("Encoded input does not match payload")
         digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
         if binding.get("inputHash") != digest:
             raise AdmissionError("Input hash mismatch")

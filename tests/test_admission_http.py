@@ -34,7 +34,8 @@ class AdmissionHTTPContracts(HTTPFixture, unittest.TestCase):
     def request(self, operation, *, token=None, binding=None):
         connection = self.connect()
         message = {"version": 1, "operation": operation,
-                   "binding": binding or self.binding, "payload": self.payload}
+                   "binding": binding or self.binding,
+                   "payloadJson": json.dumps(self.payload, sort_keys=True, separators=(",", ":"))}
         headers = {"Content-Type": "application/json"}
         if token is not None:
             headers["Authorization"] = "Bearer " + token
@@ -87,7 +88,8 @@ class AdmissionHTTPContracts(HTTPFixture, unittest.TestCase):
     def test_duplicate_authorization_headers_are_rejected(self):
         connection = self.connect()
         body = json.dumps({"version": 1, "operation": "admit",
-                           "binding": self.binding, "payload": self.payload})
+                           "binding": self.binding,
+                           "payloadJson": json.dumps(self.payload, sort_keys=True, separators=(",", ":"))})
         connection.putrequest("POST", "/admission/v1")
         connection.putheader("Authorization", "Bearer " + self.token)
         connection.putheader("Authorization", "Bearer " + "b" * 32)
@@ -103,7 +105,8 @@ class AdmissionHTTPContracts(HTTPFixture, unittest.TestCase):
             with self.subTest(version=version):
                 connection = self.connect()
                 message = {"version": version, "operation": "admit",
-                           "binding": self.binding, "payload": self.payload}
+                           "binding": self.binding,
+                           "payloadJson": json.dumps(self.payload, sort_keys=True, separators=(",", ":"))}
                 connection.request("POST", "/admission/v1", json.dumps(message),
                                    {"Authorization": "Bearer " + self.token})
                 response = connection.getresponse()
@@ -149,7 +152,9 @@ class AdmissionHTTPContracts(HTTPFixture, unittest.TestCase):
             finally:
                 worker.join(3)
             self.assertFalse(worker.is_alive())
-        self.assertEqual(responses, [(200, {"version": 1, "record": {"state": "unknown"}})])
+        self.assertEqual(responses, [(200, {
+            "version": 1, "binding": self.binding, "record": {"state": "unknown"},
+        })])
         self.assertEqual(len(self.effects), 1)
 
     def test_stalled_real_queue_times_out_without_effect(self):

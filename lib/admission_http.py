@@ -3,6 +3,7 @@
 import hmac
 import math
 import threading
+import json
 
 from .request_admission import AdmissionError
 
@@ -59,14 +60,29 @@ class AdmissionHTTP:
         if operation == "withdraw":
             return self._receiver.withdraw(principal, binding)
         if operation == "admit":
-            payload = message.get("payload")
+            encoded = message.get("payloadJson")
+            if not isinstance(encoded, str):
+                raise AdmissionError("Admission requires exact payloadJson bytes")
+            def reject_constant(value):
+                raise AdmissionError("Non-JSON input")
+            def unique_object(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise AdmissionError("Duplicate input key")
+                    result[key] = value
+                return result
+            payload = json.loads(encoded, parse_constant=reject_constant,
+                                 object_pairs_hook=unique_object)
             if not isinstance(payload, dict):
                 raise AdmissionError("Admission payload must be an object")
             if not self._slots.acquire(blocking=False):
                 raise AdmissionCapacityError("Admission capacity exhausted")
             timer = None
             try:
-                record, consumer = self._receiver.prepare(principal, binding, payload)
+                record, consumer = self._receiver.prepare(
+                    principal, binding, payload, encoded_payload=encoded,
+                )
                 if consumer is None:
                     return record
                 cancelled = threading.Event()

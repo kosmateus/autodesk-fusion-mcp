@@ -341,7 +341,9 @@ class MCPServer:
                     # Never turn a lost terminal result into proof of no effect.
                     self._send_empty(500, close=True)
                     return
-                self._send_json_response(200, {"version": 1, "record": result})
+                self._send_json_response(200, {
+                    "version": 1, "binding": message["binding"], "record": result,
+                })
 
             def do_DELETE(self):
                 """Handle DELETE requests (session termination)."""
