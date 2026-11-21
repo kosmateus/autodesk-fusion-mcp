@@ -100,8 +100,10 @@ class MCPServer:
         allowed_origins=None,
         max_tool_requests: int = 16,
         tool_timeout: float = 120.0,
+        admission_api=None,
     ):
         self.port = port
+        self.admission_api = admission_api
         # Keep legacy single-tool attributes for backwards compat
         self.tool_handler = tool_handler
         self.tool_name = tool_name
@@ -270,10 +272,57 @@ class MCPServer:
                 parsed = urlparse(self.path)
                 if parsed.path == "/mcp":
                     self._handle_mcp_post()
+                elif parsed.path == "/admission/v1" and server_ref.admission_api is not None:
+                    self._handle_admission_post()
                 else:
                     # The body was not consumed, so do not interpret it as
                     # the next request on a keep-alive connection.
                     self._send_empty(404, close=True)
+
+            def _handle_admission_post(self):
+                from .request_admission import AdmissionError
+
+                try:
+                    principal = server_ref.admission_api.authenticate(
+                        self.headers.get_all("Authorization", [])
+                    )
+                except PermissionError:
+                    self._send_empty(401, close=True)
+                    return
+                lengths = self.headers.get_all("Content-Length", [])
+                if (self.headers.get_all("Transfer-Encoding", [])
+                        or len(lengths) != 1 or not lengths[0].isdigit()):
+                    self._send_empty(400, close=True)
+                    return
+                size = int(lengths[0])
+                if size == 0 or size > 8 * 1024 * 1024:
+                    self._send_empty(413, close=True)
+                    return
+                old_timeout = self.connection.gettimeout()
+                try:
+                    self.connection.settimeout(10)
+                    body = self.rfile.read(size)
+                    if len(body) != size:
+                        self._send_empty(400, close=True)
+                        return
+                except (TimeoutError, OSError):
+                    self._send_empty(408, close=True)
+                    return
+                finally:
+                    self.connection.settimeout(old_timeout)
+                try:
+                    def reject_constant(value):
+                        raise ValueError("Non-JSON constant")
+                    message = json.loads(body.decode("utf-8"), parse_constant=reject_constant)
+                    result = server_ref.admission_api.handle(principal, message)
+                except (AdmissionError, ValueError, UnicodeError):
+                    self._send_empty(400, close=True)
+                    return
+                except Exception:
+                    # Never turn a lost terminal result into proof of no effect.
+                    self._send_empty(500, close=True)
+                    return
+                self._send_json_response(200, {"version": 1, "record": result})
 
             def do_DELETE(self):
                 """Handle DELETE requests (session termination)."""

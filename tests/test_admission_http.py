@@ -1,0 +1,96 @@
+"""Real HTTP boundary with durable admission and a controlled SDK substitute."""
+
+import json
+import unittest
+
+from lib.admission_http import AdmissionHTTP
+import test_admission_receiver
+from test_http_protocols import HTTPFixture
+
+
+class AdmissionHTTPContracts(HTTPFixture, unittest.TestCase):
+    def setUp(self):
+        test_admission_receiver.ReceiverContracts.setUp(self)
+        self.effects = []
+        self.sends = []
+
+        def dispatch(payload, *, admission_consumer):
+            self.sends.append(payload)
+            return admission_consumer(self.execute)
+
+        self.token = "a" * 32
+        self.api = AdmissionHTTP(
+            self.receiver, dispatch, credentials={self.token: "owner", "b" * 32: "other"},
+        )
+        self.start_server(admission_api=self.api)
+
+    def execute(self, payload):
+        self.effects.append(payload)
+        return {"ok": True}
+
+    def request(self, operation, *, token=None, binding=None):
+        connection = self.connect()
+        message = {"version": 1, "operation": operation,
+                   "binding": binding or self.binding, "payload": self.payload}
+        headers = {"Content-Type": "application/json"}
+        if token is not None:
+            headers["Authorization"] = "Bearer " + token
+        connection.request("POST", "/admission/v1", json.dumps(message), headers)
+        response = connection.getresponse()
+        body = response.read()
+        return response.status, json.loads(body) if body else None
+
+    def test_authentication_and_owner_are_checked_before_admission(self):
+        for token, expected in [(None, 401), ("wrong", 401), ("b" * 32, 400)]:
+            with self.subTest(token=token):
+                self.assertEqual(self.request("admit", token=token)[0], expected)
+        self.assertEqual(self.effects, [])
+        self.assertIsNone(self.receiver.status("owner", self.binding))
+
+    def test_duplicate_and_status_do_not_dispatch_again(self):
+        first = self.request("admit", token=self.token)
+        duplicate = self.request("admit", token=self.token)
+        status = self.request("status", token=self.token)
+        self.assertEqual(first[0], 200)
+        self.assertEqual(first, duplicate)
+        self.assertEqual(first, status)
+        self.assertEqual(len(self.sends), 1)
+        self.assertEqual(len(self.effects), 1)
+
+    def test_withdrawal_blocks_late_admission_without_dispatch(self):
+        withdrawn = self.request("withdraw", token=self.token)
+        admitted = self.request("admit", token=self.token)
+        self.assertEqual(withdrawn[0], 200)
+        self.assertEqual(admitted, withdrawn)
+        self.assertEqual(admitted[1]["record"]["state"], "withdrawn")
+        self.assertEqual(self.sends, [])
+        self.assertEqual(self.effects, [])
+
+    def test_exception_after_effect_remains_unknown_without_retry(self):
+        def interrupted(payload):
+            self.effects.append(payload)
+            raise RuntimeError("Effect occurred without terminal receipt")
+
+        self.execute = interrupted
+        self.assertEqual(self.request("admit", token=self.token)[0], 500)
+        status = self.request("status", token=self.token)
+        retry = self.request("admit", token=self.token)
+        self.assertEqual(status[0], 200)
+        self.assertEqual(status[1]["record"]["state"], "unknown")
+        self.assertEqual(retry, status)
+        self.assertEqual(len(self.sends), 1)
+        self.assertEqual(len(self.effects), 1)
+
+    def test_duplicate_authorization_headers_are_rejected(self):
+        connection = self.connect()
+        body = json.dumps({"version": 1, "operation": "admit",
+                           "binding": self.binding, "payload": self.payload})
+        connection.putrequest("POST", "/admission/v1")
+        connection.putheader("Authorization", "Bearer " + self.token)
+        connection.putheader("Authorization", "Bearer " + "b" * 32)
+        connection.putheader("Content-Length", str(len(body.encode())))
+        connection.endheaders(body.encode())
+        response = connection.getresponse()
+        self.assertEqual(response.status, 401)
+        response.read()
+        self.assertEqual(self.sends, [])
