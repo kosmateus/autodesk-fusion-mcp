@@ -50,7 +50,7 @@ class RuntimeAdmissionContracts(unittest.TestCase):
     def write_provision(self):
         self.file.write_text(json.dumps(self.provision), encoding="utf-8")
 
-    def start_runtime(self):
+    def start_runtime(self, *, wait_for_starter=True):
         if "FUSION_MCP_ADMISSION_PROVISION" in os.environ and not self.database.exists():
             with admission_runtime.AdmissionStore(
                 self.database, instance=self.provision["instance"], epoch=self.provision["epoch"],
@@ -63,7 +63,9 @@ class RuntimeAdmissionContracts(unittest.TestCase):
         self.assertTrue(ping.wait(2))
         self.assertIsNone(runtime._server, "Socket must not bind before readiness round-trip")
         self.handler.notify(None)
-        self.wait_until(lambda: runtime._server is not None and not runtime._server_lock.locked())
+        self.wait_until(lambda: runtime._server is not None)
+        if wait_for_starter:
+            self.wait_until(lambda: not runtime._server_lock.locked())
         self.port = runtime._server.httpd.server_address[1]
         self.app.fireCustomEvent.reset_mock(side_effect=True)
 
@@ -325,6 +327,43 @@ class RuntimeAdmissionContracts(unittest.TestCase):
         self.start_runtime()
         self.assertEqual(self.call("status", binding)[1]["state"], "terminal")
         read_name.assert_called_once()
+
+    def test_busy_starter_defers_handoff_without_sealing_recovery(self):
+        published, release = threading.Event(), threading.Event()
+        log = runtime.log
+
+        def hold_published_listener(message, *args):
+            if message.startswith("[SUCCESS]"):
+                published.set()
+                release.wait(8)
+            log(message, *args)
+
+        binding, encoded = self.payload()
+        during, _ = self.payload(request="withdraw-while-busy")
+        after, _ = self.payload(request="withdraw-after-release")
+        with patch.object(runtime, "log", side_effect=hold_published_listener):
+            try:
+                self.start_runtime(wait_for_starter=False)
+                self.assertTrue(published.wait(2))
+                self.assertTrue(runtime._server_lock.locked())
+                self.assertEqual(self.call("withdraw", binding), (200, {"state": "withdrawn"}))
+                with patch.object(runtime._admission, "advance_generation") as advance:
+                    self.assertFalse(runtime.handoff_admission_generation(
+                        instance="addin", epoch="next"))
+                    advance.assert_not_called()
+                self.assertEqual(self.generation(), ("addin", "first"))
+                self.assertEqual(self.call("admit", binding, encoded), (503, None))
+                self.assertEqual(self.call("status", binding), (200, {"state": "withdrawn"}))
+                self.assertEqual(self.call("withdraw", during), (200, {"state": "withdrawn"}))
+            finally:
+                release.set()
+                self.wait_until(lambda: not runtime._server_lock.locked())
+
+        self.assertEqual(self.call("status", binding), (200, {"state": "withdrawn"}))
+        self.assertEqual(self.call("withdraw", after), (200, {"state": "withdrawn"}))
+        self.assertEqual(self.call("admit", binding, encoded), (503, None))
+        self.assertTrue(runtime.handoff_admission_generation(instance="addin", epoch="next"))
+        self.assertEqual(self.generation(), ("addin", "next"))
 
     def test_rejected_epoch_preserves_recovery_without_reopening_admit(self):
         self.start_runtime()

@@ -235,11 +235,13 @@ def _require_main_thread():
         raise RuntimeError("Fusion runtime lifecycle requires the main thread")
 
 
-def _seal():
+def _begin_rundown():
     if _admission:
         _admission.http.begin_quiescence()
-    if not request_main_thread_shutdown():
-        return False
+    return request_main_thread_shutdown()
+
+
+def _seal_if_idle():
     return _admission is None or _admission.http.seal_if_idle()
 
 
@@ -261,11 +263,13 @@ def handoff_admission_generation(*, instance, epoch):
     _require_main_thread()
     if _admission is None:
         raise RuntimeError("No admission runtime to hand off")
-    if _host_stop is not None or not _seal():
+    if _host_stop is not None or not _begin_rundown():
         return False
     if not _server_lock.acquire(blocking=False):
         return False
     try:
+        if not _seal_if_idle():
+            return False
         try:
             _admission.advance_generation(instance=instance, epoch=epoch)
         except GenerationUnchangedError:
@@ -281,14 +285,14 @@ def _finish_host_stop():
     global _host_stop
     if _host_stop is None:
         return True
-    if not _seal():
+    if not _begin_rundown():
         return False
     if not _server_lock.acquire(blocking=False):
         return False
     try:
         # A cold-start worker may have published a listener after the
-        # first seal attempt. Its own shutdown flag already fences admit.
-        if not _seal():
+        # first rundown attempt. Its own shutdown flag already fences admit.
+        if not _begin_rundown() or not _seal_if_idle():
             return False
         _retire()
         (on_retired,) = _host_stop
