@@ -129,7 +129,7 @@ def set_tool_handler(handler):
     _callback_impl = handler
 
 
-def dispatch_to_main_thread(call_data):
+def dispatch_to_main_thread(call_data, *, admission_consumer=None):
     """Submit *call_data* for execution on the Fusion main thread and block
     until the result is available.  If already on the main thread, execute
     directly."""
@@ -139,10 +139,13 @@ def dispatch_to_main_thread(call_data):
     if threading.current_thread() is threading.main_thread():
         if _callback_impl is None:
             raise RuntimeError("Tool implementation is not initialized")
+        if admission_consumer is not None:
+            return admission_consumer(_callback_impl)
         return _callback_impl(call_data)
 
     reply = queue.Queue(maxsize=1)
-    envelope = {"payload": call_data, "reply": reply}
+    envelope = {"payload": call_data, "reply": reply,
+                "admission_consumer": admission_consumer}
     _pending.put(envelope)
 
     try:
@@ -219,7 +222,8 @@ def _flush_pending():
                     continue
                 if _callback_impl is None:
                     raise RuntimeError("Tool implementation is not initialized")
-                result = _callback_impl(payload)
+                consumer = envelope.get("admission_consumer")
+                result = consumer(_callback_impl) if consumer is not None else _callback_impl(payload)
             except Exception as exc:
                 tb = traceback.format_exc()
                 log(
