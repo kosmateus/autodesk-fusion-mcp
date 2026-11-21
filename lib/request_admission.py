@@ -6,6 +6,7 @@ terminal evidence is UNKNOWN and can never grant a second execution.
 
 from contextlib import contextmanager
 import json
+from pathlib import Path
 import sqlite3
 import threading
 import uuid
@@ -23,17 +24,24 @@ class AdmissionStore:
     _FIELDS = {"version", "owner", "request", "instance", "epoch",
                "source", "build", "document", "inputHash"}
 
-    def __init__(self, filename, *, instance, epoch):
+    def __init__(self, filename, *, instance, epoch, create=True):
         if not all(isinstance(v, str) and v for v in (instance, epoch)):
             raise AdmissionError("Server instance and epoch are required")
         self._instance, self._epoch = instance, epoch
         self._lock = threading.RLock()
         self._claims = {}
-        self._db = sqlite3.connect(
-            filename, isolation_level=None, check_same_thread=False, timeout=5,
-        )
+        location = filename if create else Path(filename).resolve().as_uri() + "?mode=rw"
+        self._db = sqlite3.connect(location, uri=not create, isolation_level=None,
+                                   check_same_thread=False, timeout=5)
         try:
             self._db.execute("PRAGMA synchronous=FULL")
+            if not create:
+                current = self._db.execute(
+                    "SELECT instance,epoch FROM generation WHERE singleton=1"
+                ).fetchone()
+                if current != (instance, epoch):
+                    raise AdmissionError("Opening stale generation is forbidden")
+                return
             self._db.execute("""
                 CREATE TABLE IF NOT EXISTS admissions (
                     request TEXT PRIMARY KEY, binding TEXT NOT NULL,

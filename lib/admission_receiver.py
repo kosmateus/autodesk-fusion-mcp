@@ -8,14 +8,16 @@ from .admission_json import decode_json
 
 
 class AdmissionReceiver:
-    def __init__(self, store, *, source, build, resolve_document):
+    def __init__(self, store, *, source, build, resolve_document=None,
+                 select_operation=None):
         if not all(isinstance(v, str) and v for v in (source, build)):
             raise AdmissionError("Trusted source and build are required")
         self._store = store
         self._source, self._build = source, build
-        if not callable(resolve_document):
-            raise AdmissionError("Trusted document resolver required")
+        if (callable(resolve_document) == callable(select_operation)):
+            raise AdmissionError("Exactly one trusted execution adapter is required")
         self._resolve_document = resolve_document
+        self._select_operation = select_operation
 
     def _authorize(self, principal, binding):
         # Principal must come from server authentication, never request JSON.
@@ -56,16 +58,29 @@ class AdmissionReceiver:
             raise AdmissionError("Input hash mismatch")
         # Detach from mutable objects owned by an HTTP caller.
         frozen_binding = dict(binding)
+        resolve = self._select_operation(frozen_payload) if self._select_operation else None
         record, created = self._store.admit_once(frozen_binding)
         if not created:
             return record, None
 
         def consume(handler):
-            if self._resolve_document(json.loads(encoded)) != frozen_binding["document"]:
-                raise AdmissionError("Execution document mismatch")
+            current = self._store.status(frozen_binding)
+            if current["state"] != "accepted":
+                return current
+            if resolve is None:
+                descriptor = self._resolve_document(json.loads(encoded))
+                execute = lambda: handler(frozen_payload)
+            else:
+                descriptor, execute = resolve()
+            if descriptor != frozen_binding["document"]:
+                raise AdmissionTargetError("Execution document mismatch")
             if not self._store.claim(frozen_binding):
                 return self._store.status(frozen_binding)
-            result = handler(frozen_payload)
+            result = execute()
             return self._store.complete(frozen_binding, result)
 
         return record, consume
+
+
+class AdmissionTargetError(AdmissionError):
+    """The typed target was refused before the execution claim."""

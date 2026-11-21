@@ -133,6 +133,12 @@ if _PARENT_PKG not in sys.modules:
     sys.modules[f"{_PARENT_PKG}.lib"] = _lib
     _root_pkg.lib = _lib
 
+    # Server and bridge must share the same admission exception types, just
+    # as they do when loaded as submodules of the actual add-in.
+    for _module in ("admission_json", "request_admission",
+                    "admission_receiver", "admission_http"):
+        sys.modules[f"{_PARENT_PKG}.lib.{_module}"] = importlib.import_module(f"lib.{_module}")
+
     _futil = importlib.import_module("lib.fusionAddInUtils")
     sys.modules[f"{_PARENT_PKG}.lib.fusionAddInUtils"] = _futil
     _lib.fusionAddInUtils = _futil

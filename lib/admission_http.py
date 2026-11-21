@@ -4,6 +4,7 @@ import hmac
 import math
 import threading
 
+from .admission_receiver import AdmissionTargetError
 from .request_admission import AdmissionError
 
 
@@ -12,15 +13,19 @@ class AdmissionCapacityError(AdmissionError):
 
 
 class AdmissionHTTP:
-    def __init__(self, receiver, dispatch, *, credentials,
-                 max_pending=16, timeout=120.0):
-        # Credentials are supplied by server bootstrap, never by request data.
-        if not credentials or any(
+    @staticmethod
+    def validate_credentials(credentials):
+        if not isinstance(credentials, dict) or not credentials or any(
             not isinstance(token, str) or not token.isascii() or len(token) < 32
             or not isinstance(owner, str) or not owner
             for token, owner in credentials.items()
         ):
             raise ValueError("Admission requires server-configured credentials")
+
+    def __init__(self, receiver, dispatch, *, credentials,
+                 max_pending=16, timeout=120.0):
+        # Credentials are supplied by server bootstrap, never by request data.
+        self.validate_credentials(credentials)
         self._credentials = dict(credentials)
         self._receiver = receiver
         self._dispatch = dispatch
@@ -30,6 +35,23 @@ class AdmissionHTTP:
             raise ValueError("Finite positive admission timeout required")
         self._slots = threading.BoundedSemaphore(max_pending)
         self._timeout = timeout
+        self._lifecycle = threading.Lock()
+        self._accepting = True
+        self._sealed = False
+        self._requests = 0
+
+    def begin_quiescence(self):
+        """Fence new admissions; allow evidence lookup and withdrawal meanwhile."""
+        with self._lifecycle:
+            self._accepting = False
+
+    def seal_if_idle(self):
+        """Only after shared SDK dispatch is quiescent, fence all store access."""
+        with self._lifecycle:
+            if self._accepting or self._requests:
+                return False
+            self._sealed = True
+            return True
 
     def authenticate(self, authorization):
         if len(authorization) != 1:
@@ -49,6 +71,20 @@ class AdmissionHTTP:
         return principal
 
     def handle(self, principal, message):
+        with self._lifecycle:
+            if self._sealed or (
+                not self._accepting and isinstance(message, dict)
+                and message.get("operation") == "admit"
+            ):
+                raise AdmissionCapacityError("Admission runtime is quiescing")
+            self._requests += 1
+        try:
+            return self._handle(principal, message)
+        finally:
+            with self._lifecycle:
+                self._requests -= 1
+
+    def _handle(self, principal, message):
         if (not isinstance(message, dict)
                 or type(message.get("version")) is not int or message["version"] != 1):
             raise AdmissionError("Unsupported admission protocol")
@@ -78,6 +114,8 @@ class AdmissionHTTP:
                 try:
                     self._dispatch({"_cancel_event": cancelled},
                                    admission_consumer=consumer)
+                except AdmissionTargetError:
+                    raise
                 except Exception as exc:
                     # Adapter failures are not malformed client input, even
                     # when their Python exception happens to be ValueError.

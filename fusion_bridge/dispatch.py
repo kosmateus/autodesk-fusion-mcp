@@ -8,6 +8,7 @@ from datetime import datetime
 import adsk.core
 
 from ..lib import fusionAddInUtils as futil
+from ..lib.admission_receiver import AdmissionTargetError
 
 # ── Module state ──────────────────────────────────────────────────────────
 
@@ -17,6 +18,9 @@ _callback_event = None
 _scheduler_active = threading.Event()
 _halt = threading.Event()
 _run_lock = threading.Lock()
+_lifecycle_lock = threading.Lock()
+_generation = object()
+_running_handlers = 0
 
 _deferred_messages = []
 _msg_lock = threading.Lock()
@@ -80,27 +84,32 @@ def drain_logs():
 class _BridgeEventHandler(adsk.core.CustomEventHandler):
     """Responds to the custom Fusion event by draining the work queue."""
 
-    def __init__(self):
+    def __init__(self, generation=None):
         super().__init__()
+        self._generation = generation
 
     def notify(self, args):
         del args
+        if self._generation is not None:
+            with _lifecycle_lock:
+                if self._generation is not _generation:
+                    return
         _flush_pending()
 
 
 # ── Recursive timer scheduler ────────────────────────────────────────────
 
 
-def _schedule_tick():
+def _schedule_tick(active):
     """Fire a single tick, then reschedule if still active."""
-    if not _scheduler_active.is_set():
+    if not active.is_set():
         return
     try:
         _fire_event_if_needed()
     except Exception as exc:
         log(f"Scheduler tick error: {exc}", adsk.core.LogLevels.ErrorLogLevel)
-    if _scheduler_active.is_set():
-        t = threading.Timer(_TICK_INTERVAL, _schedule_tick)
+    if active.is_set():
+        t = threading.Timer(_TICK_INTERVAL, _schedule_tick, (active,))
         t.daemon = True
         t.start()
 
@@ -129,24 +138,42 @@ def set_tool_handler(handler):
     _callback_impl = handler
 
 
+def bind_dispatch():
+    """Bind an HTTP listener to this dispatch lifetime, including keep-alives."""
+    with _lifecycle_lock:
+        generation = _generation
+
+    def dispatch(call_data, *, admission_consumer=None):
+        return _submit(generation, call_data, admission_consumer)
+
+    return dispatch
+
+
 def dispatch_to_main_thread(call_data, *, admission_consumer=None):
     """Submit *call_data* for execution on the Fusion main thread and block
     until the result is available.  If already on the main thread, execute
     directly."""
+    with _lifecycle_lock:
+        generation = _generation
+    return _submit(generation, call_data, admission_consumer)
+
+
+def _submit(generation, call_data, admission_consumer):
     cancelled = call_data.get("_cancel_event")
-    if cancelled is not None and (cancelled.is_set() or _halt.is_set()):
-        return _cancelled_result()
     if threading.current_thread() is threading.main_thread():
-        if _callback_impl is None:
-            raise RuntimeError("Tool implementation is not initialized")
-        if admission_consumer is not None:
-            return admission_consumer(_callback_impl)
-        return _callback_impl(call_data)
+        return _execute(generation, call_data, admission_consumer)
 
     reply = queue.Queue(maxsize=1)
-    envelope = {"payload": call_data, "reply": reply,
-                "admission_consumer": admission_consumer}
-    _pending.put(envelope)
+    envelope = {
+        "generation": generation, "payload": call_data, "reply": reply,
+        "admission_consumer": admission_consumer,
+    }
+    with _lifecycle_lock:
+        if _halt.is_set() or generation is not _generation or (
+            cancelled is not None and cancelled.is_set()
+        ):
+            return _cancelled_result()
+        _pending.put(envelope)
 
     try:
         get_app().fireCustomEvent(CALLBACK_EVENT_ID)
@@ -167,19 +194,47 @@ def dispatch_to_main_thread(call_data, *, admission_consumer=None):
         }
 
     if cancelled is None:
-        return reply.get()  # Legacy lifecycle is handled separately.
+        return _receive(reply)
     while True:
         if cancelled.is_set() or _halt.is_set():
             cancelled.set()
             _try_remove(envelope)
             return _cancelled_result()
         try:
-            return reply.get(timeout=0.05)
+            return _receive(reply, timeout=0.05)
         except queue.Empty:
             pass
 
 
 # ── Internal helpers ─────────────────────────────────────────────────────
+
+
+def _receive(reply, timeout=None):
+    result = reply.get(timeout=timeout)
+    if isinstance(result, AdmissionTargetError):
+        raise result
+    return result
+
+
+def _execute(generation, payload, consumer):
+    global _running_handlers
+    cancelled = payload.get("_cancel_event")
+    with _lifecycle_lock:
+        if _halt.is_set() or generation is not _generation or (
+            cancelled is not None and cancelled.is_set()
+        ):
+            return _cancelled_result()
+        handler = _callback_impl
+        if handler is None:
+            raise RuntimeError("Tool implementation is not initialized")
+        _running_handlers += 1
+    try:
+        if consumer is not None:
+            return consumer(handler)
+        return handler(payload)
+    finally:
+        with _lifecycle_lock:
+            _running_handlers -= 1
 
 
 def _cancelled_result():
@@ -215,15 +270,11 @@ def _flush_pending():
             payload = envelope["payload"]
             reply = envelope["reply"]
             try:
-                cancelled = payload.get("_cancel_event")
-                if cancelled is not None and (cancelled.is_set() or _halt.is_set()):
-                    reply.put(_cancelled_result())
-                    processed += 1
-                    continue
-                if _callback_impl is None:
-                    raise RuntimeError("Tool implementation is not initialized")
-                consumer = envelope.get("admission_consumer")
-                result = consumer(_callback_impl) if consumer is not None else _callback_impl(payload)
+                result = _execute(
+                    envelope["generation"], payload, envelope["admission_consumer"],
+                )
+            except AdmissionTargetError as exc:
+                result = exc
             except Exception as exc:
                 tb = traceback.format_exc()
                 log(
@@ -257,29 +308,53 @@ def _flush_pending():
 
 
 def init_main_thread_dispatch():
-    global _callback_event, _registered
+    global _callback_event, _registered, _generation, _scheduler_active
 
-    if _registered:
-        raise RuntimeError("Main-thread dispatch is already initialized")
+    with _lifecycle_lock:
+        if _registered or _running_handlers:
+            raise RuntimeError("The prior main-thread dispatch is not retired")
 
-    _halt.clear()
     _scheduler_active.clear()
+    _scheduler_active = threading.Event()
+    generation = object()
     _callback_event = get_app().registerCustomEvent(CALLBACK_EVENT_ID)
-    handler = _BridgeEventHandler()
+    handler = _BridgeEventHandler(generation)
     _callback_event.add(handler)
     # Store handler on the event object to prevent GC
     _callback_event._bridge_handler = handler
     _registered = True
+    with _lifecycle_lock:
+        _generation = generation
+        _halt.clear()
 
     _scheduler_active.set()
-    _schedule_tick()
+    _schedule_tick(_scheduler_active)
+
+
+def quiesce_main_thread_dispatch():
+    """Close intake without waiting on Fusion's main thread.
+
+    A re-entrant stop cannot complete while a handler remains on the stack.
+    Pending envelopes never become executable again.
+    """
+    with _lifecycle_lock:
+        _halt.set()
+        while True:
+            try:
+                envelope = _pending.get_nowait()
+            except queue.Empty:
+                break
+            envelope["reply"].put_nowait(_cancelled_result())
+        return _running_handlers == 0
 
 
 def stop_main_thread_dispatch():
     global _callback_event, _registered
 
-    _halt.set()
+    quiescent = quiesce_main_thread_dispatch()
     _scheduler_active.clear()
+    if not quiescent:
+        return False
 
     if _callback_event and hasattr(_callback_event, "_bridge_handler"):
         try:
@@ -307,6 +382,7 @@ def stop_main_thread_dispatch():
 
     _registered = False
     _callback_event = None
+    return True
 
 
 def get_shutdown_flag():

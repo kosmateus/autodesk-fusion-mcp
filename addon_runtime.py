@@ -25,7 +25,8 @@ def stop(context):
     del context
     try:
         fusion_runtime.log("Autodesk Fusion MCP stopping...")
-        fusion_runtime.stop()
+        if not fusion_runtime.stop():
+            return
         commands.stop()
         futil.clear_handlers()
         fusion_runtime.log("[OK] Autodesk Fusion MCP stopped")
