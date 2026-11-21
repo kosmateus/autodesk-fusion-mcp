@@ -1,6 +1,7 @@
 """Production bootstrap and HTTP/SDK dispatch, without a Fusion process."""
 
 import _fusion_test_bootstrap  # noqa: F401
+from contextlib import closing
 import hashlib
 import http.client
 import json
@@ -144,7 +145,7 @@ class RuntimeAdmissionContracts(unittest.TestCase):
         return document, read_name
 
     def generation(self):
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db:
             return db.execute("SELECT instance, epoch FROM generation").fetchone()
 
     def test_disabled_and_invalid_provision_do_not_create_admission_database(self):
@@ -239,7 +240,7 @@ class RuntimeAdmissionContracts(unittest.TestCase):
         old_handler = self.handler
         self.assertTrue(runtime.handoff_admission_generation(instance="addin", epoch="next"))
         self.assertEqual(self.generation(), ("addin", "next"))
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db:
             self.assertEqual(db.execute(
                 "SELECT state, result FROM admissions WHERE request='request'").fetchone(),
                 ("claimed", None))

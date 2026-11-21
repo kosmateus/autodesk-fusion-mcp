@@ -2,11 +2,12 @@
 
 import importlib.util
 import json
-import selectors
+import queue
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 
 SOURCE = Path(__file__).resolve().parents[1] / "lib" / "request_admission.py"
@@ -119,10 +120,21 @@ with module.AdmissionStore(sys.argv[2], instance="instance-a", epoch="epoch-a") 
                     stderr=subprocess.PIPE, text=True,
                 ))
             for child in children:
-                with selectors.DefaultSelector() as selector:
-                    selector.register(child.stdout, selectors.EVENT_READ)
-                    self.assertTrue(selector.select(timeout=10), "Receiver not ready")
-                self.assertEqual(child.stdout.readline().strip(), "ready")
+                # Windows selectors cannot wait on a subprocess pipe.
+                ready = queue.Queue(maxsize=1)
+                reader = threading.Thread(
+                    target=lambda pipe=child.stdout, result=ready: result.put(pipe.readline()),
+                    daemon=True,
+                )
+                reader.start()
+                try:
+                    self.assertEqual(ready.get(timeout=10).strip(), "ready")
+                except queue.Empty:
+                    # Unblock readline before cleanup calls communicate().
+                    child.kill()
+                    self.fail("Receiver not ready")
+                finally:
+                    reader.join(timeout=10)
             for child in children:
                 child.stdin.write("claim\n")
                 child.stdin.flush()
