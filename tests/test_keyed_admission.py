@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import selectors
 from pathlib import Path
 import subprocess
 import sys
@@ -95,6 +96,48 @@ os._exit(23)
                 reopened.withdraw(self.binding)
             with self.assertRaises(admission.AdmissionError):
                 reopened.complete(self.binding, {"invented": "result"})
+
+    def test_independent_receivers_grant_only_one_execution(self):
+        self.store.admit(self.binding)
+        program = """
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("admission", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+with module.AdmissionStore(sys.argv[2], instance="instance-a", epoch="epoch-a") as store:
+    print("ready", flush=True)
+    assert sys.stdin.readline().strip() == "claim"
+    print(json.dumps(store.claim(json.loads(sys.argv[3]))), flush=True)
+"""
+        children = []
+        try:
+            for _ in range(2):
+                children.append(subprocess.Popen(
+                    [sys.executable, "-I", "-S", "-c", program, str(SOURCE),
+                     self.file, json.dumps(self.binding)],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True,
+                ))
+            for child in children:
+                with selectors.DefaultSelector() as selector:
+                    selector.register(child.stdout, selectors.EVENT_READ)
+                    self.assertTrue(selector.select(timeout=10), "Receiver not ready")
+                self.assertEqual(child.stdout.readline().strip(), "ready")
+            for child in children:
+                child.stdin.write("claim\n")
+                child.stdin.flush()
+            claims = []
+            for child in children:
+                stdout, stderr = child.communicate(timeout=10)
+                self.assertEqual(child.returncode, 0, stderr)
+                claims.append(json.loads(stdout))
+            self.assertEqual(sorted(claims), [False, True])
+            self.assertEqual(self.store.status(self.binding)["state"], "unknown")
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.communicate(timeout=10)
 
 
 if __name__ == "__main__":
