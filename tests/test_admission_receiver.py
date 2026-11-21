@@ -122,6 +122,22 @@ class ReceiverContracts(unittest.TestCase):
         consumer(lambda payload: effects.append(payload["arguments"]["code"]))
         self.assertEqual(effects, ["original"])
 
+    def test_exact_input_parser_rejects_duplicates_and_overflow_before_admission(self):
+        for encoded in ('{"n":1,"n":2}', '{"n":1e400}', '{"n":NaN}'):
+            with self.subTest(encoded=encoded):
+                binding = dict(self.binding, inputHash=hashlib.sha256(encoded.encode()).hexdigest())
+                with self.assertRaises(ValueError):
+                    self.receiver.prepare_encoded("owner", binding, encoded)
+                self.assertIsNone(self.receiver.status("owner", binding))
+
+    def test_exact_input_has_one_authoritative_typed_representation(self):
+        encoded = '{"n":true}'
+        binding = dict(self.binding, inputHash=hashlib.sha256(encoded.encode()).hexdigest())
+        _, consumer = self.receiver.prepare_encoded("owner", binding, encoded)
+        seen = []
+        consumer(lambda payload: seen.append(payload["n"]))
+        self.assertIs(seen[0], True)
+
 
 if __name__ == "__main__":
     unittest.main()

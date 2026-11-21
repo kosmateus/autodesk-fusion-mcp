@@ -282,6 +282,7 @@ class MCPServer:
             def _handle_admission_post(self):
                 from .request_admission import AdmissionError
                 from .admission_http import AdmissionCapacityError
+                from .admission_json import decode_json
 
                 try:
                     principal = server_ref.admission_api.authenticate(
@@ -327,9 +328,7 @@ class MCPServer:
                 finally:
                     self.connection.settimeout(old_timeout)
                 try:
-                    def reject_constant(value):
-                        raise ValueError("Non-JSON constant")
-                    message = json.loads(body.decode("utf-8"), parse_constant=reject_constant)
+                    message = decode_json(body.decode("utf-8"))
                     result = server_ref.admission_api.handle(principal, message)
                 except AdmissionCapacityError:
                     self._send_empty(503, close=True)

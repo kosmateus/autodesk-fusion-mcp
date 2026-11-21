@@ -3,7 +3,6 @@
 import hmac
 import math
 import threading
-import json
 
 from .request_admission import AdmissionError
 
@@ -63,26 +62,11 @@ class AdmissionHTTP:
             encoded = message.get("payloadJson")
             if not isinstance(encoded, str):
                 raise AdmissionError("Admission requires exact payloadJson bytes")
-            def reject_constant(value):
-                raise AdmissionError("Non-JSON input")
-            def unique_object(pairs):
-                result = {}
-                for key, value in pairs:
-                    if key in result:
-                        raise AdmissionError("Duplicate input key")
-                    result[key] = value
-                return result
-            payload = json.loads(encoded, parse_constant=reject_constant,
-                                 object_pairs_hook=unique_object)
-            if not isinstance(payload, dict):
-                raise AdmissionError("Admission payload must be an object")
             if not self._slots.acquire(blocking=False):
                 raise AdmissionCapacityError("Admission capacity exhausted")
             timer = None
             try:
-                record, consumer = self._receiver.prepare(
-                    principal, binding, payload, encoded_payload=encoded,
-                )
+                record, consumer = self._receiver.prepare_encoded(principal, binding, encoded)
                 if consumer is None:
                     return record
                 cancelled = threading.Event()
@@ -92,7 +76,7 @@ class AdmissionHTTP:
                 # Local lifecycle metadata is not part of the admitted payload.
                 # The consumer passes its frozen original to the SDK handler.
                 try:
-                    self._dispatch(dict(payload, _cancel_event=cancelled),
+                    self._dispatch({"_cancel_event": cancelled},
                                    admission_consumer=consumer)
                 except Exception as exc:
                     # Adapter failures are not malformed client input, even

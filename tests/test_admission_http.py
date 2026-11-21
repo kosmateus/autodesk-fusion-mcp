@@ -206,3 +206,23 @@ class AdmissionHTTPContracts(HTTPFixture, unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(responses[0][0], 200)
         self.assertEqual(len(self.effects), 1)
+
+    def test_duplicate_envelope_and_binding_keys_are_rejected(self):
+        binding = json.dumps(self.binding)
+        payload = json.dumps(json.dumps(self.payload, sort_keys=True, separators=(",", ":")))
+        envelopes = [
+            '{"version":1,"version":1,"operation":"admit","binding":' + binding +
+            ',"payloadJson":' + payload + '}',
+            '{"version":1,"operation":"admit","binding":' +
+            binding.replace('"owner": "owner"', '"owner": "owner","owner": "owner"') +
+            ',"payloadJson":' + payload + '}',
+        ]
+        for body in envelopes:
+            connection = self.connect()
+            connection.request("POST", "/admission/v1", body,
+                               {"Authorization": "Bearer " + self.token})
+            response = connection.getresponse()
+            self.assertEqual(response.status, 400)
+            response.read()
+        self.assertEqual(self.sends, [])
+        self.assertIsNone(self.receiver.status("owner", self.binding))
