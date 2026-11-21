@@ -103,6 +103,8 @@ _adsk_mock.core.CustomEventHandler = type(
     "CustomEventHandler", (), {"__init__": lambda self: None}
 )
 _adsk_mock.core.Event = type("Event", (), {"add": lambda self, handler: None})
+_adsk_mock.core.CommandCreatedEventArgs = type("CommandCreatedEventArgs", (), {})
+_adsk_mock.core.CommandEventArgs = type("CommandEventArgs", (), {})
 # Stubs for value_builders.py constructors
 _adsk_mock.core.ValueInput = type(
     "ValueInput",
@@ -179,6 +181,12 @@ if _PARENT_PKG not in sys.modules:
     _lib = importlib.import_module("lib")
     sys.modules[f"{_PARENT_PKG}.lib"] = _lib
     _root_pkg.lib = _lib
+
+    # Server and bridge must share the same admission exception types, just
+    # as they do when loaded as submodules of the actual add-in.
+    for _module in ("admission_json", "request_admission",
+                    "admission_receiver", "admission_http"):
+        sys.modules[f"{_PARENT_PKG}.lib.{_module}"] = importlib.import_module(f"lib.{_module}")
 
     _futil = importlib.import_module("lib.fusionAddInUtils")
     sys.modules[f"{_PARENT_PKG}.lib.fusionAddInUtils"] = _futil

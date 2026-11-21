@@ -4,12 +4,15 @@ import queue
 import threading
 import time
 import traceback
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import datetime
 
 import adsk.core
 
 from .. import settings
 from ..lib import fusionAddInUtils as futil
+from ..lib.admission_receiver import AdmissionTargetError
 
 # ── Module state ──────────────────────────────────────────────────────────
 
@@ -19,6 +22,18 @@ _callback_event = None
 _scheduler_active = threading.Event()
 _halt = threading.Event()
 _run_lock = threading.Lock()
+_lifecycle_lock = threading.Lock()
+_running_handlers = 0
+_running_signals = 0
+_deferred_retirement = None
+
+
+@dataclass
+class _Retirement:
+    shutdown: threading.Event
+    callback: Callable[[], bool]
+    done: threading.Event = field(default_factory=threading.Event)
+    delivering: bool = False
 
 _deferred_messages = []
 _msg_lock = threading.Lock()
@@ -82,12 +97,17 @@ def drain_logs():
 class _BridgeEventHandler(adsk.core.CustomEventHandler):
     """Responds to the custom Fusion event by draining the work queue."""
 
-    def __init__(self):
+    def __init__(self, shutdown=None):
         super().__init__()
+        self._shutdown = shutdown
 
     def notify(self, args):
         del args
+        if self._shutdown is not None and self._shutdown.is_set():
+            _try_deferred_retirement(self._shutdown)
+            return
         _flush_pending()
+        _try_deferred_retirement(self._shutdown)
 
 
 # ── Recursive timer scheduler ────────────────────────────────────────────
@@ -99,7 +119,7 @@ def _schedule_tick(shutdown=None):
     if shutdown.is_set() or not _scheduler_active.is_set():
         return
     try:
-        _fire_event_if_needed()
+        _fire_event_if_needed(shutdown)
     except Exception as exc:
         log(f"Scheduler tick error: {exc}", adsk.core.LogLevels.ErrorLogLevel)
     if _scheduler_active.is_set() and not shutdown.is_set():
@@ -111,7 +131,7 @@ def _schedule_tick(shutdown=None):
 _last_fire_time = 0.0
 
 
-def _fire_event_if_needed():
+def _fire_event_if_needed(shutdown=None):
     """Signal the main thread when there is queued work or a keepalive is due."""
     import time
 
@@ -120,8 +140,31 @@ def _fire_event_if_needed():
     has_work = not _pending.empty()
     keepalive_due = (now - _last_fire_time) >= _KEEPALIVE_INTERVAL
     if has_work or keepalive_due:
+        if _fire_signal(_halt if shutdown is None else shutdown):
+            _last_fire_time = now
+
+
+def _fire_signal(shutdown, *, retirement=None):
+    """Count calls into the SDK, not merely handlers reached by the event."""
+    global _running_signals
+    with _lifecycle_lock:
+        if shutdown is not _halt:
+            return False
+        if retirement is None:
+            if shutdown.is_set():
+                return False
+        elif (
+            retirement is not _deferred_retirement or retirement.delivering
+            or _running_handlers or _running_signals
+        ):
+            return False
+        _running_signals += 1
+    try:
         get_app().fireCustomEvent(CALLBACK_EVENT_ID)
-        _last_fire_time = now
+        return True
+    finally:
+        with _lifecycle_lock:
+            _running_signals -= 1
 
 
 # ── Public dispatch API ──────────────────────────────────────────────────
@@ -216,41 +259,55 @@ def cancel_request(request_key):
     return True
 
 
-def dispatch_to_main_thread(call_data):
+def bind_dispatch(shutdown=None):
+    """Bind a listener (including keep-alives) to one dispatch lifetime."""
+    shutdown = _halt if shutdown is None else shutdown
+
+    def dispatch(call_data, *, admission_consumer=None):
+        return _submit(shutdown, call_data, admission_consumer)
+
+    return dispatch
+
+
+def dispatch_to_main_thread(call_data, *, admission_consumer=None):
     """Submit *call_data* for execution on the Fusion main thread and block
     until the result is available.  If already on the main thread, execute
     directly."""
+    return _submit(_halt, call_data, admission_consumer)
+
+
+def _submit(shutdown, call_data, admission_consumer):
     cancel_event = (
         call_data.get("_cancel_event") if isinstance(call_data, dict) else None
     )
-    shutdown = _halt
-    if shutdown.is_set() or (cancel_event is not None and cancel_event.is_set()):
-        return _text_result(_CANCELLED_TEXT)
     if threading.current_thread() is threading.main_thread():
-        if _callback_impl is None:
-            raise RuntimeError("Tool implementation is not initialized")
-        return _callback_impl(call_data)
+        return _execute(shutdown, call_data, admission_consumer)
 
     reply = queue.Queue(maxsize=1)
     envelope = _new_envelope(call_data, reply)
     envelope["_shutdown"] = shutdown
+    envelope["_admission_consumer"] = admission_consumer
 
     request_key = (
         call_data.get("_request_key") if isinstance(call_data, dict) else None
     )
-    if request_key is not None:
-        envelope["_request_key"] = request_key
-        with _inflight_lock:
-            if request_key in _inflight:
-                return _text_result("Error: Request ID is already in flight in this session")
-            _inflight[request_key] = envelope
-            # Publish the envelope before cancellation can find it.
+    with _lifecycle_lock:
+        if (shutdown is not _halt or shutdown.is_set()
+                or (cancel_event is not None and cancel_event.is_set())):
+            return _text_result(_CANCELLED_TEXT)
+        if request_key is not None:
+            envelope["_request_key"] = request_key
+            with _inflight_lock:
+                if request_key in _inflight:
+                    return _text_result("Error: Request ID is already in flight in this session")
+                _inflight[request_key] = envelope
+                # Publish the envelope before cancellation can find it.
+                _pending.put(envelope)
+        else:
             _pending.put(envelope)
-    else:
-        _pending.put(envelope)
 
     try:
-        get_app().fireCustomEvent(CALLBACK_EVENT_ID)
+        _fire_signal(shutdown)
     except Exception as exc:
         with envelope["_lock"]:
             if envelope["_state"] == "queued" and _try_remove(envelope):
@@ -277,7 +334,7 @@ def dispatch_to_main_thread(call_data):
             _deregister_inflight(envelope)
             return _text_result(_CANCELLED_TEXT)
         try:
-            return reply.get(timeout=0.05)
+            return _dispatch_result(reply.get(timeout=0.05))
         except queue.Empty:
             pass
         if time.monotonic() >= deadline:
@@ -290,7 +347,31 @@ def dispatch_to_main_thread(call_data):
                    else "request may still be executing"),
                 adsk.core.LogLevels.ErrorLogLevel,
             )
-            return result
+            return _dispatch_result(result)
+
+
+def _dispatch_result(result):
+    if isinstance(result, AdmissionTargetError):
+        raise result
+    return result
+
+
+def _execute(shutdown, payload, consumer):
+    global _running_handlers
+    cancel_event = payload.get("_cancel_event") if isinstance(payload, dict) else None
+    with _lifecycle_lock:
+        if (shutdown is not _halt or shutdown.is_set()
+                or (cancel_event is not None and cancel_event.is_set())):
+            return _text_result(_CANCELLED_TEXT)
+        handler = _callback_impl
+        if handler is None:
+            raise RuntimeError("Tool implementation is not initialized")
+        _running_handlers += 1
+    try:
+        return consumer(handler) if consumer is not None else handler(payload)
+    finally:
+        with _lifecycle_lock:
+            _running_handlers -= 1
 
 
 def _classify_timeout(envelope):
@@ -343,16 +424,21 @@ def wait_for_main_thread(poll_interval=1.0, shutdown=None):
     if threading.current_thread() is threading.main_thread():
         return True
 
-    while shutdown is None or not shutdown.is_set():
+    generation = _halt
+    shutdown = generation if shutdown is None else shutdown
+    while not generation.is_set() and not shutdown.is_set():
         reply = queue.Queue(maxsize=1)
         envelope = _new_envelope(
             {"params": {"name": "__startup_ping__"}}, reply
         )
-        envelope["_shutdown"] = shutdown
-        _pending.put(envelope)
+        envelope["_shutdown"] = generation
+        with _lifecycle_lock:
+            if generation is not _halt or generation.is_set() or shutdown.is_set():
+                return False
+            _pending.put(envelope)
 
         try:
-            get_app().fireCustomEvent(CALLBACK_EVENT_ID)
+            _fire_signal(generation)
         except Exception:
             # The scheduler's keepalive ticks fire this event too, so a
             # single failure here is not fatal.
@@ -365,7 +451,7 @@ def wait_for_main_thread(poll_interval=1.0, shutdown=None):
             continue
         _try_remove(envelope)
         if _is_ready_reply(result):
-            return True
+            return not generation.is_set() and not shutdown.is_set()
         # A reply that is not the expected ready answer means the ping was
         # mishandled; keep waiting for a genuine main-thread round-trip.
 
@@ -465,9 +551,10 @@ def _flush_pending():
                 continue
 
             try:
-                if _callback_impl is None:
-                    raise RuntimeError("Tool implementation is not initialized")
-                result = _callback_impl(payload)
+                result = _execute(shutdown if shutdown is not None else _halt,
+                                  payload, envelope.get("_admission_consumer"))
+            except AdmissionTargetError as exc:
+                result = exc
             except Exception as exc:
                 tb = traceback.format_exc()
                 log(
@@ -506,14 +593,14 @@ def _flush_pending():
 def init_main_thread_dispatch():
     global _callback_event, _registered, _halt
 
-    if _registered:
-        raise RuntimeError("Main-thread dispatch is already initialized")
-
-    # A stopped generation stays stopped, even after a fast restart.
-    _halt = threading.Event()
+    with _lifecycle_lock:
+        if _registered or _running_handlers or _running_signals:
+            raise RuntimeError("The prior main-thread dispatch is not retired")
+        # A stopped generation stays stopped, even after a fast restart.
+        _halt = threading.Event()
     _scheduler_active.clear()
     _callback_event = get_app().registerCustomEvent(CALLBACK_EVENT_ID)
-    handler = _BridgeEventHandler()
+    handler = _BridgeEventHandler(_halt)
     _callback_event.add(handler)
     # Store handler on the event object to prevent GC
     _callback_event._bridge_handler = handler
@@ -523,25 +610,78 @@ def init_main_thread_dispatch():
     _schedule_tick()
 
 
-def request_main_thread_shutdown():
+def request_main_thread_shutdown(shutdown=None):
     """Signal shutdown from any thread; no Fusion API calls here."""
-    _halt.set()
-    _scheduler_active.clear()
-    while True:
-        try:
-            envelope = _pending.get_nowait()
-        except queue.Empty:
-            break
+    pending = []
+    with _lifecycle_lock:
+        if shutdown is not None and shutdown is not _halt:
+            return False
+        _halt.set()
+        _scheduler_active.clear()
+        while True:
+            try:
+                pending.append(_pending.get_nowait())
+            except queue.Empty:
+                break
+        quiescent = _running_handlers == 0 and _running_signals == 0
+    for envelope in pending:
         with envelope["_lock"]:
             envelope["_state"] = "cancelled"
         _deregister_inflight(envelope)
         _put_reply(envelope["reply"], _text_result(_QUEUED_CANCEL_TEXT))
+    return quiescent
+
+
+def defer_main_thread_retirement(callback):
+    """Arrange a main-thread continuation for a host stop that cannot wait."""
+    global _deferred_retirement
+    with _lifecycle_lock:
+        if not _registered or _deferred_retirement is not None:
+            return
+        retirement = _Retirement(_halt, callback)
+        _deferred_retirement = retirement
+
+    def signal_until_retired():
+        while not retirement.done.wait(_TICK_INTERVAL):
+            try:
+                _fire_signal(retirement.shutdown, retirement=retirement)
+            except Exception as exc:
+                log(f"Retirement signal failed: {exc}", adsk.core.LogLevels.ErrorLogLevel)
+
+    thread = threading.Thread(target=signal_until_retired, daemon=True)
+    thread.start()
+
+
+def _try_deferred_retirement(shutdown):
+    if threading.current_thread() is not threading.main_thread():
+        return
+    with _lifecycle_lock:
+        retirement = _deferred_retirement
+        if (retirement is None or shutdown is not retirement.shutdown
+                or retirement.delivering or _running_handlers or _running_signals):
+            return
+        # Do not let the control worker issue another signal as the callback
+        # checks rundown and unregisters the event.
+        retirement.delivering = True
+    try:
+        retirement.callback()
+    finally:
+        with _lifecycle_lock:
+            retirement.delivering = False
 
 
 def stop_main_thread_dispatch():
-    global _callback_event, _registered
+    global _callback_event, _registered, _deferred_retirement
 
-    request_main_thread_shutdown()
+    if not request_main_thread_shutdown():
+        return False
+    with _lifecycle_lock:
+        # Freeze retirement signals at the same boundary as the idle check.
+        if _running_handlers or _running_signals:
+            return False
+        if _deferred_retirement is not None:
+            _deferred_retirement.done.set()
+            _deferred_retirement = None
 
     if _callback_event and hasattr(_callback_event, "_bridge_handler"):
         try:
@@ -569,6 +709,7 @@ def stop_main_thread_dispatch():
 
     _registered = False
     _callback_event = None
+    return True
 
 
 def get_shutdown_flag():
