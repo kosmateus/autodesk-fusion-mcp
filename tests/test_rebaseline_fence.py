@@ -137,7 +137,8 @@ class NativeFenceContracts(unittest.TestCase):
             storeInode=self.request["store"]["inode"], expectedHead=self.request["expectedHead"],
             expectedFiles={name: None for name in (
                 "physical-backend-head.json", "isolated-admission-epoch.json",
-                "instance.json", "queue-state.json", "runtime-rebaseline-head.json",
+                "instance.json", "queue-state.json", "queue-state.pending.json",
+                "runtime-rebaseline-head.json",
             )},
             activationFile=self.store_path + "/runtime-rebaseline-head.json",
             activationBytes=json.dumps(dict(version=1, newHead="4" * 64, record=reference),
@@ -413,6 +414,101 @@ print("PENDING_COMMITTED",flush=True)
                 rebaseline_fence.consume_fence(operator, proof)
         self.assertEqual(rebaseline_fence.query_fence(operator, dict(requestId="operation-1"))["state"], "pending")
 
+    def test_manifest_accepts_exact_root_six_and_complete_one_epoch_three(self):
+        pending = self.begin()
+        operator, _ = self.operator("operator-B")
+        roots = json.loads(self.publication(pending["binding"])["publicationJson"])["expectedFiles"]
+        self.assertEqual(len(roots), 6)
+        for epoch in (None, "epoch_A-7", "x" * 128):
+            files = dict(roots)
+            if epoch is not None:
+                files.update({
+                    "admission-epochs/" + epoch + "/" + name: "a" * 64
+                    for name in ("instance.json", "queue-state.json", "queue-state.pending.json")
+                })
+            with self.subTest(epoch=epoch):
+                proof = self.publication(pending["binding"], expectedFiles=files)
+                operator.verify_publication(pending["binding"], proof)
+
+    def test_manifest_rejects_old_root_five_missing_pending_extra_and_cross_namespace(self):
+        pending = self.begin()
+        operator, _ = self.operator("operator-B")
+        roots = json.loads(self.publication(pending["binding"])["publicationJson"])["expectedFiles"]
+        epoch = {
+            "admission-epochs/epoch-A/" + name: "a" * 64
+            for name in ("instance.json", "queue-state.json", "queue-state.pending.json")
+        }
+        full = dict(roots, **epoch)
+        invalid = {
+            "old-root-five": {k: v for k, v in roots.items() if k != "queue-state.pending.json"},
+            "missing-epoch-pending": {k: v for k, v in full.items()
+                                      if k != "admission-epochs/epoch-A/queue-state.pending.json"},
+            "extra-root": dict(roots, **{"unapproved.json": None}),
+            "extra-epoch": dict(full, **{"admission-epochs/epoch-A/unapproved.json": None}),
+            "cross-namespace": {
+                **roots, "admission-epochs/epoch-A/instance.json": None,
+                "admission-epochs/epoch-B/queue-state.json": None,
+                "admission-epochs/epoch-A/queue-state.pending.json": None,
+            },
+            "two-complete-epochs": dict(full, **{
+                key.replace("epoch-A", "epoch-B"): value for key, value in epoch.items()
+            }),
+        }
+        for bad_epoch in ("..", "../epoch-A", "epoch.A", "epoch A", "", "x" * 129):
+            invalid["invalid-epoch-" + bad_epoch] = dict(roots, **{
+                "admission-epochs/" + bad_epoch + "/" + name: None
+                for name in ("instance.json", "queue-state.json", "queue-state.pending.json")
+            })
+        invalid["backslash-namespace"] = dict(roots, **{
+            key.replace("/", "\\"): value for key, value in epoch.items()
+        })
+        for name, files in invalid.items():
+            # Even a trusted publisher's MAC cannot authorize a malformed scope.
+            with self.subTest(layout=name), self.assertRaises(AdmissionError):
+                rebaseline_fence.consume_fence(
+                    operator, self.publication(pending["binding"], expectedFiles=files),
+                )
+        self.assertEqual(rebaseline_fence.query_fence(operator, dict(requestId="operation-1"))["state"], "pending")
+
+    def test_root_and_epoch_pending_ledgers_and_epoch_identity_are_byte_bound(self):
+        pending = self.begin()
+        operator, _ = self.operator("operator-B")
+        roots = json.loads(self.publication(pending["binding"])["publicationJson"])["expectedFiles"]
+        files = dict(roots, **{
+            "admission-epochs/epoch-A/" + name: "a" * 64
+            for name in ("instance.json", "queue-state.json", "queue-state.pending.json")
+        })
+        original = self.publication(pending["binding"], expectedFiles=files)
+        for changed in ("queue-state.pending.json", "admission-epochs/epoch-A/queue-state.pending.json",
+                        "epoch-identity"):
+            proof = copy.deepcopy(original)
+            publication = json.loads(proof["publicationJson"])
+            if changed == "epoch-identity":
+                publication["expectedFiles"] = {
+                    key.replace("epoch-A", "epoch-B"): value for key, value in files.items()
+                }
+            else:
+                publication["expectedFiles"][changed] = "b" * 64
+            proof["publicationJson"] = json.dumps(publication, separators=(",", ":"))
+            with self.subTest(changed=changed), self.assertRaises(AdmissionError):
+                rebaseline_fence.consume_fence(operator, proof)
+        consumed = rebaseline_fence.consume_fence(operator, original)
+        self.assertEqual(consumed["publicationJson"], original["publicationJson"])
+
+    def test_verified_profile_composition_does_not_reopen_operator_path(self):
+        _, profile_path = self.operator()
+        # Trusted helper authenticates these exact bytes and retains the decoded
+        # profile; a later pathname replacement must not change its authority.
+        verified_profile = json.loads(physical_authority._read_private_bytes(profile_path))
+        write_private(profile_path, dict(untrusted="replacement"))
+        with patch.object(rebaseline_fence, "_read_private_bytes",
+                          side_effect=AssertionError("must not reopen operator path")):
+            operator = rebaseline_fence.OperatorAuthority(verified_profile)
+            pending = rebaseline_fence.begin_fence(operator, self.request)
+            self.assertEqual(rebaseline_fence.query_fence(operator, dict(requestId="operation-1")), pending)
+            consumed = rebaseline_fence.consume_fence(operator, self.publication(pending["binding"]))
+            self.assertEqual(consumed["state"], "consumed")
+
     def test_other_operation_and_mutated_original_intent_are_refused(self):
         self.begin()
         for changes in (
@@ -587,7 +683,7 @@ for item in (record.parent,record.parent.parent,root,root.parent):
 assert head.read_bytes()==activation.encode()
 publication=dict(store=str(root),storeDevice=request["store"]["device"],storeInode=request["store"]["inode"],
  expectedHead=binding["oldHead"],expectedFiles={name:None for name in
- ["physical-backend-head.json","isolated-admission-epoch.json","instance.json","queue-state.json","runtime-rebaseline-head.json"]},
+ ["physical-backend-head.json","isolated-admission-epoch.json","instance.json","queue-state.json","queue-state.pending.json","runtime-rebaseline-head.json"]},
  activationFile=str(head),activationBytes=activation,record=reference)
 print(json.dumps(dict(binding=binding,publicationJson=json.dumps(publication,separators=(",",":")))),flush=True)
 os._exit(73) # lost operator/lock after Linux CAS, before consume ACK

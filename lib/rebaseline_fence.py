@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import re
 from pathlib import Path, PurePosixPath
 import sys
 
@@ -122,7 +123,12 @@ def observe_process_birth(pid):
 
 
 class OperatorAuthority:
-    """Only the private OS-validated administrative carrier constructs this."""
+    """Trusted local composition from an already OS-validated private profile.
+
+    A verifier may construct this directly from the SAME bytes it authenticated,
+    avoiding a second pathname read. This is not a public request/MCP factory.
+    All runtime observations and native transactional guards remain mandatory.
+    """
 
     def __init__(self, profile):
         _exact(profile, ("kind", "version", "operatorId", "database", "runtime", "publicationVerifier"))
@@ -195,11 +201,25 @@ class OperatorAuthority:
             raise AdmissionError("Published activation pointer/reference mismatch")
         _hash(pointer["newHead"])
         files = publication["expectedFiles"]
-        if not isinstance(files, dict) or set(files) != {
+        roots = {
             "physical-backend-head.json", "isolated-admission-epoch.json",
-            "instance.json", "queue-state.json", "runtime-rebaseline-head.json",
-        }:
+            "instance.json", "queue-state.json", "queue-state.pending.json",
+            "runtime-rebaseline-head.json",
+        }
+        if not isinstance(files, dict) or not roots.issubset(files):
             raise AdmissionError("Exact immutable activation inputs required")
+        epoch_names = set(files) - roots
+        if epoch_names:
+            first = next(iter(epoch_names))
+            match = re.fullmatch(
+                r"admission-epochs/([A-Za-z0-9_-]{1,128})/"
+                r"(instance\.json|queue-state\.json|queue-state\.pending\.json)", first,
+            )
+            if match is None or epoch_names != {
+                "admission-epochs/" + match[1] + "/" + name
+                for name in ("instance.json", "queue-state.json", "queue-state.pending.json")
+            }:
+                raise AdmissionError("Exact single-epoch activation namespace required")
         for value in files.values():
             if value is not None:
                 _hash(value)

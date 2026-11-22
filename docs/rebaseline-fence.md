@@ -37,6 +37,17 @@ The CLI additionally observes the actual SDK PID/birth through read-only OS
 process APIs and compares the full binding with the runtime's registered row.
 No SDK import/probe is involved.
 
+The supported private module composition is
+`OperatorAuthority(verifiedProfile)` followed by
+`begin_fence(authority, verifiedRequest)`,
+`query_fence(authority, verifiedRequest)` or
+`consume_fence(authority, verifiedRequest)`. A trusted helper constructs the
+authority from the **same decoded private bytes** it already authenticated and
+compared against the runtime/database, rather than reopening the operator path
+through CLI/runpy. This local constructor is not a public MCP/request factory;
+independent native runtime observation and transactional guards still apply.
+The standalone CLI retains its strict private-file reader.
+
 The verifier key belongs to the persistent administrative source, not an old
 agent/session. A new authorized operator receives its own private carrier with
 its own operatorId and the same approved keyId/key, through that same local
@@ -134,6 +145,21 @@ Consume body:
 activation path/pointer and all original native/fence bindings are checked.
 `publicationDigest = SHA256(UTF8(publicationJson))`, preserving the writer's
 literal JSON.stringify bytes, not a Python reserialization.
+
+`expectedFiles` has exactly these six root names (ROOT5 is refused):
+`physical-backend-head.json`, `isolated-admission-epoch.json`, `instance.json`,
+`queue-state.json`, `queue-state.pending.json`, `runtime-rebaseline-head.json`.
+It may additionally contain exactly one complete three-file namespace:
+`admission-epochs/{epochId}/instance.json`,
+`admission-epochs/{epochId}/queue-state.json`,
+`admission-epochs/{epochId}/queue-state.pending.json`.
+The epoch ID matches `^[A-Za-z0-9_-]{1,128}$`; missing/extra files, traversal
+and mixed namespaces are refused. Each value is null or a lowercase SHA-256.
+Before signing, the trusted POSIX provider checks the actual pointer body and
+full manifest layout/hashes, including its declared root matching
+`<store>/admission-epochs/{epochId}`. The native verifier enforces the exact
+structural scope under that authenticated byte-bound publication; it does not
+pretend to observe Linux files from the native host.
 
 The trusted POSIX port computes:
 
