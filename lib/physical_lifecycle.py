@@ -50,7 +50,9 @@ class LifecycleMailbox:
                 request = envelope["request"]
                 if operation == "grant":
                     output = Path(envelope["output"])
-                    grant = self.authority.publish_grant(request, output)
+                    grant = self.authority.publish_grant(
+                        request, output, activation=envelope.get("activation"),
+                    )
                     result = dict(state="granted", handoffId=grant["handoffId"])
                 elif operation == "handoff":
                     if (set(request) != {"handoffId", "generation", "nextGeneration"}
@@ -95,6 +97,7 @@ def main(argv=None):
         sub.add_argument("--request", required=True)
         if operation == "grant":
             sub.add_argument("--output", required=True)
+            sub.add_argument("--activation")
         sub.add_argument("--timeout", type=float, default=30)
     query = commands.add_parser("query")
     query.add_argument("--database", required=True)
@@ -111,6 +114,8 @@ def main(argv=None):
         if not output.is_absolute():
             parser.error("--output must be absolute")
         envelope["output"] = str(output)
+        if args.activation is not None:
+            envelope["activation"] = read_private(Path(args.activation))
     directory = private_directory(authority_directory() / "mailbox")
     request_id = secrets.token_hex(16)
     path = directory / (request_id + ".request.json")

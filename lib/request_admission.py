@@ -36,9 +36,14 @@ class AdmissionStore:
         self._instance, self._epoch = instance, epoch
         self._lock = threading.RLock()
         self._claims = {}
+        self._path = None if str(filename) == ":memory:" else Path(filename).resolve()
         location = filename if create else Path(filename).resolve().as_uri() + "?mode=rw"
         self._db = sqlite3.connect(location, uri=not create, isolation_level=None,
                                    check_same_thread=False, timeout=5)
+        self._file_identity = None
+        if self._path is not None:
+            info = self._path.stat()
+            self._file_identity = (info.st_dev, info.st_ino)
         try:
             self._db.execute("PRAGMA synchronous=FULL")
             if not create:
@@ -106,6 +111,7 @@ class AdmissionStore:
         if handoff_id is not None and (not isinstance(handoff_id, str) or not handoff_id):
             raise GenerationUnchangedError("A nonempty handoff ID is required")
         with self._transaction():
+            self.assert_provision_lifecycle_allowed()
             self._db.execute("""
                 CREATE TABLE IF NOT EXISTS physical_handoffs (
                     id TEXT PRIMARY KEY, result TEXT NOT NULL
@@ -145,6 +151,9 @@ class AdmissionStore:
             if handoff_id is not None:
                 self._db.execute("INSERT INTO physical_handoffs VALUES (?,?)",
                                  (handoff_id, _encode(result)))
+            if self._provision_fence_head() is not None:
+                from .rebaseline_fence_store import retire_after_handoff
+                retire_after_handoff(self, instance, epoch, handoff_id)
             return result
 
     def assert_current_generation(self):
@@ -154,12 +163,58 @@ class AdmissionStore:
             ).fetchone() != (self._instance, self._epoch):
                 raise AdmissionError("Physical generation is no longer current")
 
-    def bind_physical_owner(self, descriptor):
+    def _provision_fence_head(self):
+        tables = {row[0] for row in self._db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('provision_fence_head','provision_fences')",
+        )}
+        pointer = (self._db.execute(
+            "SELECT request_id FROM provision_fence_head WHERE singleton=1",
+        ).fetchone() if "provision_fence_head" in tables else None)
+        if pointer is None:
+            if "provision_fences" in tables and self._db.execute(
+                "SELECT 1 FROM provision_fences LIMIT 1",
+            ).fetchone():
+                raise AdmissionError("Durable provision fence pointer is missing")
+            return None
+        row = self._db.execute(
+            "SELECT request_id,binding,key_id,key_digest,state,publication_json,receipt_json "
+            "FROM provision_fences WHERE request_id=?", pointer,
+        ).fetchone()
+        if row is None or row[4] not in ("pending", "consumed"):
+            raise AdmissionError("Durable provision fence is unproven")
+        return row
+
+    def _guard_pending_provision(self):
+        row = self._provision_fence_head()
+        if row is not None and row[4] == "pending":
+            raise AdmissionError("Durable rebaseline provision fence is pending")
+
+    def assert_provision_lifecycle_allowed(self):
+        with self._lock:
+            if self._provision_fence_head() is None:
+                return
+            from .rebaseline_fence_store import assert_handoff_allowed
+            assert_handoff_allowed(self)
+
+    def assert_sdk_authority(self, activation=None):
+        from .rebaseline_fence_store import assert_activation
+        with self._lock:
+            self.assert_current_generation()
+            assert_activation(self, activation)
+
+    def register_physical_runtime(self, pins):
+        from .rebaseline_fence_store import register_runtime
+        return register_runtime(self, pins)
+
+    def bind_physical_owner(self, descriptor, *, activation=None):
         """Persist the owner binding in this same store, never another queue DB."""
         generation = _encode(descriptor["generation"])
         binding = _encode(descriptor)
         with self._transaction():
             self.assert_current_generation()
+            from .rebaseline_fence_store import assert_activation
+            assert_activation(self, activation, descriptor=descriptor)
             if self._db.execute("SELECT COUNT(*) FROM generation_history").fetchone()[0] > 1:
                 self._db.execute("""
                     CREATE TABLE IF NOT EXISTS physical_handoffs (
@@ -197,6 +252,7 @@ class AdmissionStore:
     def prepare_physical_turn(self, binding):
         with self._transaction():
             self.assert_current_generation()
+            self._guard_pending_provision()
             self._turn_schema()
             if self._db.execute(
                 "SELECT 1 FROM physical_turns WHERE id=?", (binding["turnId"],),
@@ -210,6 +266,7 @@ class AdmissionStore:
     def start_physical_turn(self, binding):
         with self._transaction():
             self.assert_current_generation()
+            self._guard_pending_provision()
             changed = self._db.execute(
                 "UPDATE physical_turns SET state='active' "
                 "WHERE id=? AND binding=? AND state='queued'",
@@ -385,11 +442,11 @@ class AdmissionStore:
         return _encode(binding)
 
     @contextmanager
-    def _transaction(self):
+    def _transaction(self, *, read_snapshot=False):
         with self._lock:
             if self._db is None:
                 raise AdmissionError("Store closed")
-            self._db.execute("BEGIN IMMEDIATE")
+            self._db.execute("BEGIN DEFERRED" if read_snapshot else "BEGIN IMMEDIATE")
             try:
                 yield
                 self._db.execute("COMMIT")
@@ -435,6 +492,7 @@ class AdmissionStore:
         """Only the transaction creating the admission may schedule its callback."""
         encoded = self._binding(binding)
         with self._transaction():
+            self._guard_pending_provision()
             created = self._read(binding, encoded) is None
             if created:
                 self._db.execute(
@@ -446,6 +504,7 @@ class AdmissionStore:
     def withdraw(self, binding):
         encoded = self._binding(binding)
         with self._transaction():
+            self._guard_pending_provision()
             row = self._read(binding, encoded)
             if row is None:
                 self._db.execute(
@@ -466,6 +525,7 @@ class AdmissionStore:
         token = str(uuid.uuid4())
         with self._lock:
             with self._transaction():
+                self._guard_pending_provision()
                 row = self._read(binding, encoded)
                 if row is None:
                     raise AdmissionError("Request not admitted")

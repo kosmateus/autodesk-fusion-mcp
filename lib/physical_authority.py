@@ -41,7 +41,7 @@ def _validate_windows_private_acl(owner, current, allowed_principals):
         raise AdmissionError("Private Windows owner and DACL required")
 
 
-def _check_windows_acl(path):
+def _check_windows_acl(path, *, handle=None):
     """Fail closed on public/inherited ACLs, including nonstandard allow ACEs."""
     if os.name != "nt":
         return
@@ -57,6 +57,12 @@ def _check_windows_acl(path):
                                           wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
     advapi.GetNamedSecurityInfoW.argtypes = [
         wintypes.LPWSTR, ctypes.c_int, wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi.GetSecurityInfo.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, wintypes.DWORD,
         ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
         ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
         ctypes.POINTER(ctypes.c_void_p),
@@ -88,8 +94,13 @@ def _check_windows_acl(path):
     finally:
         kernel.CloseHandle(token)
     owner, dacl, descriptor = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
-    if advapi.GetNamedSecurityInfoW(str(path), 1, 5, ctypes.byref(owner), None,
-                                   ctypes.byref(dacl), None, ctypes.byref(descriptor)):
+    if handle is None:
+        error = advapi.GetNamedSecurityInfoW(str(path), 1, 5, ctypes.byref(owner), None,
+                                             ctypes.byref(dacl), None, ctypes.byref(descriptor))
+    else:
+        error = advapi.GetSecurityInfo(handle, 1, 5, ctypes.byref(owner), None,
+                                      ctypes.byref(dacl), None, ctypes.byref(descriptor))
+    if error:
         raise AdmissionError("Cannot validate private Windows ACL")
     try:
         if not dacl.value:
@@ -131,19 +142,82 @@ def read_private(path):
 
 
 def _read_private_bytes(path):
-    """No symlink following; validate the opened inode rather than a prior stat."""
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    """Read only the validated, stable regular FD/HANDLE; never a pathname ACL oracle."""
+    if os.name == "nt":
+        fd = _open_windows_private_reader(path)
+    else:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or (
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or (
             os.name != "nt" and (info.st_uid != os.getuid() or info.st_mode & 0o077)
-        ) or Path(path).is_symlink():
+        ):
             raise AdmissionError("A private regular file is required")
-        _check_windows_acl(path)
+        def stamp(value):
+            return (value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+                    value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+
+        # Windows CRT fstat and pathname stat expose different identity/time
+        # representations. Do not mix those APIs: the actual Windows HANDLE is
+        # already frozen against write/delete and validated by file-info/ACL.
+        if os.name != "nt" and stamp(Path(path).lstat()) != stamp(info):
+            raise AdmissionError("Private file pathname does not name the opened inode")
+        if os.name == "nt":
+            import msvcrt
+            _check_windows_acl(None, handle=msvcrt.get_osfhandle(fd))
         with os.fdopen(fd, "rb", closefd=False) as stream:
-            return stream.read()
+            result = stream.read()
+        if stamp(os.fstat(fd)) != stamp(info) or (
+            os.name != "nt" and stamp(Path(path).lstat()) != stamp(info)
+        ):
+            raise AdmissionError("Private file changed while reading")
+        if os.name == "nt":
+            _check_windows_acl(None, handle=msvcrt.get_osfhandle(fd))
+        return result
     finally:
         os.close(fd)
+
+
+def _open_windows_private_reader(path):
+    """Freeze the real file against writes/deletion and reject reparse/pipe handles."""
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                   ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                                   wintypes.HANDLE]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.GetFileType.argtypes = [wintypes.HANDLE]
+    kernel.GetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+
+    class FileInfo(ctypes.Structure):
+        _fields_ = [("attributes", wintypes.DWORD), ("creation", wintypes.FILETIME),
+                    ("access", wintypes.FILETIME), ("write", wintypes.FILETIME),
+                    ("volume", wintypes.DWORD), ("sizeHigh", wintypes.DWORD),
+                    ("sizeLow", wintypes.DWORD), ("links", wintypes.DWORD),
+                    ("indexHigh", wintypes.DWORD), ("indexLow", wintypes.DWORD)]
+
+    # GENERIC_READ | READ_CONTROL; SHARE_READ only; OPEN_EXISTING; OPEN_REPARSE_POINT.
+    handle = kernel.CreateFileW(str(path), 0x80020000, 1, None, 3, 0x00200000, None)
+    if handle == wintypes.HANDLE(-1).value:
+        if ctypes.get_last_error() in (2, 3):  # Preserve mailbox missing-file semantics.
+            raise FileNotFoundError(2, "Private file does not exist", str(path))
+        raise AdmissionError("Cannot open stable private Windows file")
+    try:
+        info = FileInfo()
+        if (kernel.GetFileType(handle) != 1
+                or not kernel.GetFileInformationByHandle(handle, ctypes.byref(info))
+                or info.attributes & (0x400 | 0x10) or info.links != 1):
+            raise AdmissionError("Private Windows regular non-reparse file required")
+        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+        handle = None  # CRT descriptor now owns the SAME validated HANDLE.
+        return fd
+    finally:
+        if handle is not None:
+            kernel.CloseHandle(handle)
 
 
 def write_private(path, value):
@@ -237,6 +311,7 @@ class PhysicalAuthority:
         self._lease = None
         self._store = store
         self._grant = None
+        self._activation = None
         self._revoked = False
         self.directory = private_directory(authority_directory())
         self.database = Path(provision["database"]).resolve()
@@ -257,11 +332,12 @@ class PhysicalAuthority:
                     raise AdmissionError("Host physical authority is bound to another database")
             else:
                 write_private(binding_path, binding)
+            self._store.register_physical_runtime(self._pins)
         except BaseException:
             self.close()
             raise
 
-    def issue(self, descriptor):
+    def issue(self, descriptor, *, activation=None):
         if (not isinstance(descriptor, dict) or set(descriptor) != {
             "kind", "version", "handoffId", "generation", "brokerOwner",
             "endpointURL", "physicalRuntime",
@@ -280,13 +356,14 @@ class PhysicalAuthority:
         with self._lock:
             if self._lease is None or self._revoked:
                 raise AdmissionError("Physical authority is retired")
-            self._store.bind_physical_owner(descriptor)
+            self._store.bind_physical_owner(descriptor, activation=activation)
             if self._grant is None:
                 self._grant = copy.deepcopy(descriptor)
                 self._grant["token"] = secrets.token_urlsafe(48)
+                self._activation = copy.deepcopy(activation)
             return copy.deepcopy(self._grant)
 
-    def publish_grant(self, descriptor, output):
+    def publish_grant(self, descriptor, output, *, activation=None):
         output = Path(output)
         if not output.is_absolute():
             raise AdmissionError("An absolute private grant output is required")
@@ -306,7 +383,7 @@ class PhysicalAuthority:
                     self._grant, sort_keys=True, allow_nan=False,
                 ).encode("utf-8"):
                     raise AdmissionError("Grant output already contains another file")
-            grant = self.issue(descriptor)
+            grant = self.issue(descriptor, activation=activation)
             try:
                 publish_private(output, grant)
             except FileExistsError:
@@ -331,6 +408,7 @@ class PhysicalAuthority:
                 ):
                     raise OSError("Physical lease path changed")
                 self._store.assert_current_generation()
+                self._store.assert_sdk_authority(self._activation)
             except (OSError, AdmissionError):
                 self._revoked = True
                 raise PermissionError("Physical authority fence lost") from None
