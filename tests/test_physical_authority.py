@@ -21,6 +21,26 @@ from _physical_test_support import descriptor
 from test_http_protocols import HTTPFixture, modern, sse_message
 
 
+class WindowsPrivateACLTests(unittest.TestCase):
+    def test_elevated_administrator_owner_with_private_dacl_is_valid(self):
+        user = "S-1-5-21-offline-user"
+        physical_authority._validate_windows_private_acl(
+            "S-1-5-32-544", user, [user, "S-1-5-18", "S-1-5-32-544"],
+        )
+
+    def test_privileged_owner_never_makes_public_or_foreign_acl_private(self):
+        user = "S-1-5-21-offline-user"
+        for owner, principal in (
+            ("S-1-5-32-544", "S-1-1-0"),
+            ("S-1-5-18", "S-1-5-11"),
+            (user, "S-1-5-21-foreign"),
+            ("S-1-5-21-foreign", user),
+        ):
+            with self.subTest(owner=owner, principal=principal):
+                with self.assertRaises(AdmissionError):
+                    physical_authority._validate_windows_private_acl(owner, user, [principal])
+
+
 class PhysicalOwnershipTests(HTTPFixture, unittest.TestCase):
     def setUp(self):
         self.directory = Path(self.enterContext(tempfile.TemporaryDirectory()))

@@ -26,6 +26,15 @@ def authority_directory():
     return Path.home() / ".local" / "state" / "autodesk-fusion-mcp" / "physical"
 
 
+def _validate_windows_private_acl(owner, current, allowed_principals):
+    trusted = {current, "S-1-5-18", "S-1-5-32-544"}
+    # Elevated Windows processes create files owned by Administrators rather
+    # than their TokenUser SID. These privileged principals already control
+    # process memory; accepting their ownership does not authorize other users.
+    if owner not in trusted or any(principal not in trusted for principal in allowed_principals):
+        raise AdmissionError("Private Windows owner and DACL required")
+
+
 def _check_windows_acl(path):
     """Fail closed on public/inherited ACLs, including nonstandard allow ACEs."""
     if os.name != "nt":
@@ -77,11 +86,11 @@ def _check_windows_acl(path):
                                    ctypes.byref(dacl), None, ctypes.byref(descriptor)):
         raise AdmissionError("Cannot validate private Windows ACL")
     try:
-        if not dacl.value or sid_string(owner) != current:
-            raise AdmissionError("Private Windows owner and DACL required")
+        if not dacl.value:
+            raise AdmissionError("Private Windows DACL required")
         # ACL header: BYTE revision, BYTE reserved, WORD size, WORD ACE count.
         count = ctypes.cast(dacl.value + 4, ctypes.POINTER(wintypes.WORD))[0]
-        allowed = {current, "S-1-5-18", "S-1-5-32-544"}  # owner, SYSTEM, administrators
+        allowed_principals = []
         for index in range(count):
             ace = ctypes.c_void_p()
             if not advapi.GetAce(dacl, index, ctypes.byref(ace)):
@@ -92,8 +101,10 @@ def _check_windows_acl(path):
                 continue
             if ace_type == 1:  # A deny ACE cannot expose private data.
                 continue
-            if ace_type != 0 or sid_string(ace.value + 8) not in allowed:
-                raise AdmissionError("Private Windows ACL permits another principal")
+            if ace_type != 0:
+                raise AdmissionError("Unsupported private Windows allow ACE")
+            allowed_principals.append(sid_string(ace.value + 8))
+        _validate_windows_private_acl(sid_string(owner), current, allowed_principals)
     finally:
         kernel.LocalFree(descriptor)
 
