@@ -336,11 +336,15 @@ class PhysicalAuthority:
                 raise PermissionError("Physical authority fence lost") from None
             return PhysicalCapability(self, values[0])
 
-    def _turn_binding(self, turn_id, target):
+    @staticmethod
+    def _validate_turn_selector(turn_id, target):
         if (not isinstance(turn_id, str) or not turn_id or len(turn_id) > 256
                 or not turn_id.isascii() or not isinstance(target, str)
                 or not target or len(target.encode("utf-8")) > 16384):
             raise AdmissionError("Exact physical turn ID and document target required")
+
+    def _turn_binding(self, turn_id, target):
+        self._validate_turn_selector(turn_id, target)
         return dict(version=1, grantDigest=hashlib.sha256(json.dumps(
             self._grant, sort_keys=True, allow_nan=False,
         ).encode("utf-8")).hexdigest(), turnId=turn_id, target=target,
@@ -385,6 +389,32 @@ class PhysicalAuthority:
             if binding != expected:
                 return dict(state="unknown", binding=binding)
             return self._store.physical_turn_status(binding)
+
+    def turn_history(self, binding):
+        with self._lock:
+            # HTTP authenticates the caller; the history read additionally
+            # reasserts this object's current grant, lease and generation.
+            self.authenticate([self._grant["token"]] if self._grant is not None else [])
+            if (not isinstance(binding, dict) or set(binding) != {
+                "version", "grantDigest", "generation", "physicalRuntime", "turnId", "target",
+            } or type(binding["version"]) is not int or binding["version"] != 1):
+                raise AdmissionError("Exact private physical turn binding required")
+            generation, physical = binding["generation"], binding["physicalRuntime"]
+            if (not isinstance(generation, dict) or set(generation) != {"instance", "epoch"}
+                    or any(not isinstance(value, str) or not value for value in generation.values())
+                    or not isinstance(physical, dict) or set(physical) != {
+                        "pid", "birth", "version", "source", "build",
+                    } or type(physical["pid"]) is not int or physical["pid"] <= 0
+                    or any(not isinstance(physical[key], str) or not physical[key]
+                           for key in physical.keys() - {"pid"})
+                    or not isinstance(binding["grantDigest"], str)
+                    or len(binding["grantDigest"]) != 64
+                    or any(char not in "0123456789abcdef" for char in binding["grantDigest"])):
+                raise AdmissionError("Exact historical generation and runtime pins required")
+            # Reuse selector validation only; the old binding must NOT be
+            # reconstructed with the current grant/generation/runtime.
+            self._validate_turn_selector(binding["turnId"], binding["target"])
+            return self._store.physical_turn_history(binding)
 
     def revoke(self):
         with self._lock:

@@ -104,6 +104,56 @@ may remain UNKNOWN while its physical turn is durably released. A broker can
 then release its global SDK lane while retaining quarantine of that exact
 document and preserving the UNKNOWN job.
 
+### Ancestor turn evidence after a real handoff
+
+`POST /physical/v1/turn-history` is a **read-only** private query for an
+original turn binding from an older generation. Authenticate with exactly one
+**current** `X-Fmcad-Physical-Grant`; the old grant token is neither needed nor
+accepted. The request body is the exact original `PhysicalTurnBinding` v1 above,
+without a wrapper. Do not substitute the current grant digest, generation or
+physical runtime. No turn/target headers or SDK dispatch are needed for queries.
+
+The response has the same shape as `turn-status`. A historical `released`
+response is allowed only when:
+
+- the full original binding exactly matches an immutable `physical_turns` row
+  in the current authority's same existing AdmissionStore;
+- that row was already released by `dispatch-finally` or
+  `cancelled-before-sdk`;
+- native immutable `physical_handoffs` receipts prove the old generation is a
+  strict ancestor of the current generation, using nonempty exact handoff IDs
+  and `state: "committed"` records consistent with `generation_history`;
+- the bounded lineage is unambiguous and has no cycles or spliced/duplicate
+  parent/successor edges. At most 1024 handoff records and 1025 generation
+  history rows are examined; an over-limit history fails closed.
+
+Unproved lineage, a foreign/spliced binding, a current-generation binding,
+missing rows or old queued/active snapshots return `unknown` with no evidence.
+Malformed binding shapes return HTTP 400; missing, old or lost-current
+authentication returns HTTP 401. `turn-status` remains strict current-only.
+Unknown legacy lineage is not migrated or guessed.
+
+The historical evidence digest is **identical to the original release proof**:
+
+```text
+SHA256(UTF8(_encode({
+  "binding": ORIGINAL_BINDING,
+  "state": "released",
+  "releasedBy": STORED_REASON
+})))
+```
+
+`_encode` is Python JSON with `sort_keys=True`, `separators=(",", ":")` and
+`ensure_ascii=True` (including surrogate-pair escaping for non-BMP characters).
+`physicalEvidenceReference` remains `fmcad-physical-turn:sha256:<digest>`.
+The new grant authenticates access; it is not inserted into this old proof.
+
+History performs no SQL writes/schema creation and does not enqueue events.
+It never manufactures a release from worker/SDK death, advances a generation,
+renews an old grant, replays a turn or settles UNKNOWN. This permits a successor
+broker to recover an already durable release after its predecessor died before
+publishing quarantine, while preserving the original job and document quarantine.
+
 ## Local CLI
 
 Run from the installed fork directory:

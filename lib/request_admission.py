@@ -26,6 +26,7 @@ def _encode(value):
 
 
 class AdmissionStore:
+    _MAX_HISTORY_HANDOFFS = 1024
     _FIELDS = {"version", "owner", "request", "instance", "epoch",
                "source", "build", "document", "inputHash"}
 
@@ -243,13 +244,100 @@ class AdmissionStore:
             ).fetchone()
             if row is None or row[0] != _encode(binding):
                 return result
-            result["state"] = "released" if row[1] == "released" else "active"
             if row[1] == "released":
-                evidence = dict(binding=binding, state="released", releasedBy=row[2])
-                digest = hashlib.sha256(_encode(evidence).encode("utf-8")).hexdigest()
-                result.update(physicalEvidenceReference="fmcad-physical-turn:sha256:" + digest,
-                              evidenceDigest=digest)
+                return self._released_turn_evidence(binding, row[2])
+            result["state"] = "active"
             return result
+
+    @staticmethod
+    def _released_turn_evidence(binding, reason):
+        evidence = dict(binding=binding, state="released", releasedBy=reason)
+        digest = hashlib.sha256(_encode(evidence).encode("utf-8")).hexdigest()
+        return dict(state="released", binding=binding,
+                    physicalEvidenceReference="fmcad-physical-turn:sha256:" + digest,
+                    evidenceDigest=digest)
+
+    def physical_turn_history(self, binding):
+        """Read already-sealed ancestor evidence; never infer release or write."""
+        with self._lock:
+            self.assert_current_generation()
+            unknown = dict(state="unknown", binding=binding)
+            tables = self._db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name IN ('physical_turns','physical_handoffs')",
+            ).fetchall()
+            if len(tables) != 2:
+                return unknown
+            row = self._db.execute(
+                "SELECT binding,state,released_by FROM physical_turns WHERE id=?",
+                (binding["turnId"],),
+            ).fetchone()
+            if (row is None or row[0] != _encode(binding) or row[1] != "released"
+                    or row[2] not in ("dispatch-finally", "cancelled-before-sdk")
+                    or not self._committed_ancestor(binding["generation"])):
+                return unknown
+            return self._released_turn_evidence(binding, row[2])
+
+    def _committed_ancestor(self, generation):
+        current = (self._instance, self._epoch)
+        ancestor = (generation["instance"], generation["epoch"])
+        if ancestor == current:
+            return False
+        limit = self._MAX_HISTORY_HANDOFFS
+        rows = self._db.execute(
+            "SELECT id,result FROM physical_handoffs LIMIT ?", (limit + 1,),
+        ).fetchall()
+        generations = self._db.execute(
+            "SELECT instance,epoch FROM generation_history LIMIT ?", (limit + 2,),
+        ).fetchall()
+        if len(rows) > limit or len(generations) > limit + 1:
+            return False
+        known = set(generations)
+        if ancestor not in known or current not in known:
+            return False
+        incoming, outgoing = {}, {}
+        for handoff_id, raw in rows:
+            try:
+                record = json.loads(raw)
+                if (not isinstance(record, dict) or set(record) != {
+                    "handoffId", "generation", "nextGeneration", "state",
+                } or record["state"] != "committed" or not isinstance(handoff_id, str)
+                        or not handoff_id or record["handoffId"] != handoff_id
+                        or _encode(record) != raw):
+                    return False
+                ends = []
+                for name in ("generation", "nextGeneration"):
+                    pin = record[name]
+                    if (not isinstance(pin, dict) or set(pin) != {"instance", "epoch"}
+                            or any(not isinstance(value, str) or not value for value in pin.values())):
+                        return False
+                    ends.append((pin["instance"], pin["epoch"]))
+                source, target = ends
+            except (ValueError, TypeError, KeyError):
+                return False
+            if (source == target or source not in known or target not in known
+                    or source in outgoing or target in incoming):
+                return False
+            outgoing[source], incoming[target] = target, source
+        checked = set()
+        for source in outgoing:
+            cursor, path = source, set()
+            while cursor in outgoing and cursor not in checked:
+                if cursor in path:
+                    return False
+                path.add(cursor)
+                cursor = outgoing[cursor]
+            checked.update(path)
+        cursor, visited, found = current, set(), False
+        # Continue past the requested ancestor: reaching it before encountering
+        # a cycle is not proof of a valid committed lineage.
+        while cursor in incoming:
+            if cursor in visited:
+                return False
+            visited.add(cursor)
+            cursor = incoming[cursor]
+            found |= cursor == ancestor
+        return found
 
     def _binding(self, binding):
         if not isinstance(binding, dict) or set(binding) != self._FIELDS:
