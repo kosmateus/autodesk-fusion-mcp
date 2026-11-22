@@ -47,6 +47,13 @@ compared against the runtime/database, rather than reopening the operator path
 through CLI/runpy. This local constructor is not a public MCP/request factory;
 independent native runtime observation and transactional guards still apply.
 The standalone CLI retains its strict private-file reader.
+The reader opens POSIX files with no-follow/nonblocking flags, refuses anything
+but a single-link private regular FD, and checks inode/owner/mode/link/size/time
+stamps against that FD and pathname before and after reading. FIFO refusal does
+not depend on a timeout or killing the reader. On Windows the same actual file
+HANDLE supplies file identity and `GetSecurityInfo` owner/DACL; its share mode
+denies writes/deletion until the read and second validation finish. Reparse
+points, directories, pipes and hardlinks are refused before reading bytes.
 
 The verifier key belongs to the persistent administrative source, not an old
 agent/session. A new authorized operator receives its own private carrier with
@@ -92,6 +99,9 @@ Query body: `{requestId}`. Authenticated query is strictly read-only. No row
 returns exit 0 with exactly
 `{kind:"fmcad-provision-fence",version:1,state:"absent",requestId}`.
 Errors/parse failures are refused (exit 1), never interpreted as absent.
+In particular, a head pointer without its record table/row is corruption, not
+absence. A missing request is absent only with a consistent empty active head;
+an unrelated active operation does not authorize an automatic begin.
 Query/resume uses today's operator capability, without the old session token.
 Resume begin/consume audit actor is separate; it does not alter the frozen
 initiator or operation identity.
@@ -231,6 +241,16 @@ the approved physical generation/runtime/handoff/endpoint and its broker queue
 must be the approved POSIX store path. A delayed old grant with no activation,
 another store/root/generation or another receipt is refused. The public grant
 file v1 and SDK header schema do not acquire operator secrets.
+
+PENDING blocks ordinary handoff. CONSUMED still requires its approved ordinary
+grant before handoff, but is not a permanent global lifecycle barrier. After
+the existing producer drains/seals work, its ordinary generation CAS records
+retirement of that activation in the **same SQLite transaction**. The pointer,
+frozen binding and receipt are retained as history. A new generation must use
+its own normal handoff/owner/runtime authority; supplying the old activation is
+refused, and an ordinary grant without that stale approval remains possible.
+Authenticated query by the new current operator can still read the original
+consumed receipt as provenance. This changes neither UNKNOWN nor turn history.
 
 History/status reads retain their existing semantics. No query manufactures a
 per-turn release or settlement, and no rebaseline operation advances the native

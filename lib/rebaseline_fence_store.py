@@ -26,6 +26,64 @@ def head(store):
     return store._provision_fence_head()
 
 
+def active_head(store):
+    row = head(store)
+    if row is not None and _table(store, "provision_fence_retirements"):
+        retired = store._db.execute(
+            "SELECT handoff_id,next_instance,next_epoch FROM provision_fence_retirements "
+            "WHERE request_id=?", (row[0],),
+        ).fetchone()
+        if retired:
+            receipt = store._db.execute(
+                "SELECT result FROM physical_handoffs WHERE id=?", (retired[0],),
+            ).fetchone()
+            expected = dict(
+                handoffId=retired[0], state="committed",
+                generation=json.loads(row[1])["generation"],
+                nextGeneration=dict(instance=retired[1], epoch=retired[2]),
+            )
+            if row[4] != "consumed" or receipt is None or receipt[0] != _encode(expected):
+                raise AdmissionError("Provision retirement requires its committed ordinary handoff")
+            return None
+    return row
+
+
+def assert_handoff_allowed(store):
+    from .request_admission import GenerationUnchangedError
+    row = active_head(store)
+    if row is None:
+        return
+    if row[4] != "consumed" or row[6] is None:
+        raise GenerationUnchangedError("Durable rebaseline provision fence is pending")
+    if not _table(store, "physical_owners"):
+        raise GenerationUnchangedError("Consumed activation requires its ordinary grant before handoff")
+    owner = store._db.execute(
+        "SELECT binding FROM physical_owners WHERE generation=?",
+        (_encode(dict(instance=store._instance, epoch=store._epoch)),),
+    ).fetchone()
+    if owner is None:
+        raise GenerationUnchangedError("Consumed activation requires its ordinary grant before handoff")
+    assert_activation(store, activation_for(row[6]), descriptor=json.loads(owner[0]))
+
+
+def retire_after_handoff(store, instance, epoch, handoff_id):
+    row = active_head(store)
+    if row is None:
+        return
+    if not handoff_id:
+        from .request_admission import GenerationUnchangedError
+        raise GenerationUnchangedError("Activation retirement requires an ordinary handoff receipt")
+    # Called only after the guarded generation CAS, in its SAME transaction.
+    store._db.execute("""
+        CREATE TABLE IF NOT EXISTS provision_fence_retirements (
+            request_id TEXT PRIMARY KEY, handoff_id TEXT NOT NULL,
+            next_instance TEXT NOT NULL, next_epoch TEXT NOT NULL
+        )
+    """)
+    store._db.execute("INSERT INTO provision_fence_retirements VALUES (?,?,?,?)",
+                      (row[0], handoff_id, instance, epoch))
+
+
 def activation_for(receipt_json):
     receipt = json.loads(receipt_json)
     activation = receipt["activation"]
@@ -37,7 +95,7 @@ def activation_for(receipt_json):
 
 
 def assert_activation(store, activation, *, descriptor=None):
-    row = head(store)
+    row = active_head(store)
     if row is None:
         if activation is not None:
             raise AdmissionError("No native activation approval exists")
@@ -70,7 +128,7 @@ def register_runtime(store, pins):
                 raise AdmissionError("Registered physical database identity changed")
         if pins["generation"] != dict(instance=store._instance, epoch=store._epoch):
             raise AdmissionError("Runtime registration generation mismatch")
-        row = head(store)
+        row = active_head(store)
         if row is not None:
             binding = json.loads(row[1])
             if any(binding[key] != pins[key] for key in (
@@ -198,7 +256,7 @@ def begin(store, facts, authority):
                 _assert_empty(store)
             _audit(store, facts["requestId"], authority, "resume", facts["writerGeneration"])
             return _response(previous, authority)
-        latest = head(store)
+        latest = active_head(store)
         if latest is not None:
             if latest[4] == "pending":
                 raise AdmissionError("Another durable rebaseline operation is pending")
@@ -220,10 +278,13 @@ def begin(store, facts, authority):
 def query(store, request_id, authority):
     with store._lock:
         _verify_runtime(store, authority)
+        current = active_head(store)  # Prove pointer/table consistency BEFORE absent.
         if not _table(store, "provision_fences"):
             return dict(kind="fmcad-provision-fence", version=1, state="absent", requestId=request_id)
         row = _row(store, request_id, authority)
         if row is None:
+            if current is not None:
+                raise AdmissionError("Another operation occupies the durable provision head")
             return dict(kind="fmcad-provision-fence", version=1, state="absent", requestId=request_id)
         return _response(row, authority)
 

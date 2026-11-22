@@ -151,6 +151,9 @@ class AdmissionStore:
             if handoff_id is not None:
                 self._db.execute("INSERT INTO physical_handoffs VALUES (?,?)",
                                  (handoff_id, _encode(result)))
+            if self._provision_fence_head() is not None:
+                from .rebaseline_fence_store import retire_after_handoff
+                retire_after_handoff(self, instance, epoch, handoff_id)
             return result
 
     def assert_current_generation(self):
@@ -189,8 +192,10 @@ class AdmissionStore:
 
     def assert_provision_lifecycle_allowed(self):
         with self._lock:
-            if self._provision_fence_head() is not None:
-                raise GenerationUnchangedError("Durable rebaseline approval fences generation changes")
+            if self._provision_fence_head() is None:
+                return
+            from .rebaseline_fence_store import assert_handoff_allowed
+            assert_handoff_allowed(self)
 
     def assert_sdk_authority(self, activation=None):
         from .rebaseline_fence_store import assert_activation

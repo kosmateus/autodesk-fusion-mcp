@@ -212,6 +212,189 @@ os._exit(71)
         self.assertEqual(refused.returncode, 1)
         self.assertEqual(json.loads(refused.stdout)["state"], "refused")
 
+    def test_regression_corrupt_pointer_without_record_table_is_never_absent(self):
+        self.begin()
+        operator, _ = self.operator("operator-B")
+        self.store._db.execute("ALTER TABLE provision_fences RENAME TO lost_fence_records")
+        with self.assertRaises((AdmissionError, sqlite3.DatabaseError)):
+            rebaseline_fence.query_fence(operator, dict(requestId="operation-1"))
+        _, profile = self.operator("operator-C")
+        result = self.cli("query", profile, dict(requestId="operation-1"))
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(json.loads(result.stdout)["state"], "refused")
+
+    def test_corrupt_dropped_table_and_missing_record_pointer_fail_closed(self):
+        self.begin()
+        operator, _ = self.operator()
+        self.store._db.execute("UPDATE provision_fence_head SET request_id='missing-record'")
+        with self.assertRaises(AdmissionError):
+            rebaseline_fence.query_fence(operator, dict(requestId="missing-record"))
+        self.store._db.execute("DROP TABLE provision_fences")
+        with self.assertRaises((AdmissionError, sqlite3.DatabaseError)):
+            rebaseline_fence.query_fence(operator, dict(requestId="operation-1"))
+
+    def test_regression_consumed_grant_allows_legitimate_handoff_not_a_global_deadend(self):
+        pending = self.begin()
+        operator, _ = self.operator("operator-B")
+        with self.assertRaises(AdmissionError):
+            self.store.advance_generation(instance="next", epoch="next", handoff_id="ordinary-next")
+        consumed = rebaseline_fence.consume_fence(operator, self.publication(pending["binding"]))
+        activation = activation_for(consumed["receiptJson"])
+        with self.assertRaises(AdmissionError):
+            self.store.advance_generation(instance="next", epoch="next", handoff_id="ordinary-next")
+        grant = self.authority.issue(self.grant_descriptor(), activation=activation)
+        capability = self.authority.authenticate([grant["token"]])
+        turn = capability.prepare_turn("ordinary-turn", "document-A")
+        turn.start()
+        turn.finish()  # Existing main-thread drain still precedes the legitimate CAS.
+        receipt = self.store.advance_generation(instance="next", epoch="next", handoff_id="ordinary-next")
+        self.assertEqual(receipt["state"], "committed")
+        self.authority.close()
+        with AdmissionStore(self.database, instance="next", epoch="next", create=False) as successor:
+            provision = dict(self.provision, instance="next", epoch="next")
+            next_authority = PhysicalAuthority(provision, successor, admission_runtime._lease,
+                                               version="offline", endpoint="http://127.0.0.1:0/mcp")
+            try:
+                request = descriptor(next_authority, owner="successor", queue=self.store_path)
+                request["handoffId"] = "ordinary-next"
+                with self.assertRaises(AdmissionError):
+                    next_authority.issue(request, activation=activation)
+                ordinary = next_authority.issue(request)
+                next_authority.authenticate([ordinary["token"]])
+                profile = copy.deepcopy(self.profile)
+                profile["operatorId"] = "operator-C"
+                profile["runtime"] = dict(handoffId="ordinary-next", **copy.deepcopy(next_authority._pins))
+                current_operator = rebaseline_fence.OperatorAuthority(profile)
+                self.assertEqual(rebaseline_fence.query_fence(
+                    current_operator, dict(requestId="operation-1"),
+                ), consumed)
+                successor.advance_generation(instance="third", epoch="third", handoff_id="ordinary-third")
+                self.assertEqual(successor._db.execute(
+                    "SELECT receipt_json FROM provision_fences WHERE request_id='operation-1'",
+                ).fetchone()[0], consumed["receiptJson"])
+            finally:
+                next_authority.close()
+
+    def test_ordinary_handoff_and_activation_retirement_roll_back_together(self):
+        pending = self.begin()
+        operator, _ = self.operator()
+        consumed = rebaseline_fence.consume_fence(operator, self.publication(pending["binding"]))
+        activation = activation_for(consumed["receiptJson"])
+        self.authority.issue(self.grant_descriptor(), activation=activation)
+        from lib import rebaseline_fence_store
+        original_retire = rebaseline_fence_store.retire_after_handoff
+
+        def interrupted(*args):
+            original_retire(*args)
+            raise AdmissionError("Fixture death before ordinary handoff commit")
+
+        with patch.object(rebaseline_fence_store, "retire_after_handoff", side_effect=interrupted):
+            with self.assertRaises(AdmissionError):
+                self.store.advance_generation(instance="next", epoch="next", handoff_id="ordinary-next")
+        self.assertEqual(self.store._db.execute("SELECT instance,epoch FROM generation").fetchone(),
+                         ("runtime", "epoch"))
+        self.assertIsNone(self.store._db.execute(
+            "SELECT result FROM physical_handoffs WHERE id='ordinary-next'",
+        ).fetchone())
+        self.assertEqual(rebaseline_fence.query_fence(operator, dict(requestId="operation-1")), consumed)
+        self.authority.issue(self.grant_descriptor(), activation=activation)
+        self.store.advance_generation(instance="next", epoch="next", handoff_id="ordinary-next")
+
+    def test_unproven_retirement_cannot_clear_a_pending_fence(self):
+        self.begin()
+        self.store._db.execute(
+            "CREATE TABLE provision_fence_retirements "
+            "(request_id TEXT PRIMARY KEY,handoff_id TEXT,next_instance TEXT,next_epoch TEXT)",
+        )
+        self.store._db.execute("INSERT INTO provision_fence_retirements VALUES (?,?,?,?)",
+                               ("operation-1", "not-a-committed-handoff", "next", "next"))
+        with self.assertRaises(AdmissionError):
+            self.authority.issue(self.grant_descriptor())
+        operator, _ = self.operator()
+        with self.assertRaises(AdmissionError):
+            rebaseline_fence.query_fence(operator, dict(requestId="operation-1"))
+
+    @unittest.skipUnless(os.name == "posix", "POSIX FIFO fixture")
+    def test_regression_fifo_operator_cli_naturally_refuses_without_blocking(self):
+        fifo = self.root / "fifo-operator"
+        os.mkfifo(fifo, 0o600)
+        # timeout is a FAILURE, never a successful refusal established by killing.
+        result = self.cli("query", fifo, dict(requestId="operation-1"))
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(json.loads(result.stdout)["state"], "refused")
+
+    def test_private_regular_reader_accepts_exact_bytes_and_rejects_hardlinks(self):
+        _, path = self.operator()
+        expected = path.read_bytes()
+        self.assertEqual(physical_authority._read_private_bytes(path), expected)
+        alias = self.root / "hardlink-profile"
+        os.link(path, alias)
+        with self.assertRaises(AdmissionError):
+            physical_authority._read_private_bytes(path)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX opened inode race")
+    def test_private_reader_rejects_path_swap_or_same_inode_modification(self):
+        _, path = self.operator()
+        original_fdopen = os.fdopen
+
+        replacement = self.root / "replacement"
+        write_private(replacement, dict(untrusted="other-file"))
+
+        def swap(fd, *args, **kwargs):
+            os.replace(replacement, path)
+            return original_fdopen(fd, *args, **kwargs)
+
+        with patch.object(physical_authority.os, "fdopen", side_effect=swap):
+            with self.assertRaises(AdmissionError):
+                physical_authority._read_private_bytes(path)
+        _, path = self.operator("same-inode")
+
+        def modify(fd, *args, **kwargs):
+            with path.open("ab") as stream:
+                stream.write(b" ")
+            return original_fdopen(fd, *args, **kwargs)
+
+        with patch.object(physical_authority.os, "fdopen", side_effect=modify):
+            with self.assertRaises(AdmissionError):
+                physical_authority._read_private_bytes(path)
+
+    @unittest.skipUnless(os.name == "nt", "Actual Windows HANDLE/ACL/share fixture")
+    def test_windows_private_reader_acl_uses_frozen_actual_handle_not_path(self):
+        _, path = self.operator()
+        expected = path.read_bytes()
+        replacement = self.root / "replacement-profile"
+        write_private(replacement, dict(database="different-native-database"))
+        checker = physical_authority._check_windows_acl
+        observed = []
+
+        def check(no_path, *, handle=None):
+            self.assertIsNone(no_path)
+            self.assertIsNotNone(handle)
+            observed.append(handle)
+            with self.assertRaises(OSError):
+                os.replace(replacement, path)
+            with self.assertRaises(OSError):
+                with path.open("wb"):
+                    self.fail("Frozen HANDLE unexpectedly allowed writer")
+            return checker(None, handle=handle)
+
+        with patch.object(physical_authority, "_check_windows_acl", side_effect=check):
+            self.assertEqual(physical_authority._read_private_bytes(path), expected)
+        self.assertEqual(len(observed), 2)
+        self.assertEqual(observed[0], observed[1])
+        os.replace(replacement, path)  # No lingering share lock after verified read.
+        self.assertEqual(read_private(path), dict(database="different-native-database"))
+
+    @unittest.skipUnless(os.name == "nt", "Actual Windows HANDLE ACL refusal")
+    def test_windows_public_handle_is_rejected_before_reading_secret(self):
+        _, path = self.operator()
+        subprocess.run(["icacls", str(path), "/grant", "*S-1-1-0:(R)"],
+                       check=True, capture_output=True)
+        with patch.object(physical_authority.os, "fdopen",
+                          side_effect=AssertionError("Public HANDLE must not reach read")):
+            with self.assertRaises(AdmissionError):
+                physical_authority._read_private_bytes(path)
+
     def test_new_operator_and_writer_resume_same_frozen_identity_without_old_token(self):
         original = self.begin()
         resumed = self.begin("operator-B", writerGeneration="writer-B")
