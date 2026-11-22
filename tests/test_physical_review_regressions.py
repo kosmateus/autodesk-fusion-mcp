@@ -2,6 +2,9 @@
 
 import _fusion_test_bootstrap  # noqa: F401
 import os
+from contextlib import redirect_stdout
+import io
+import json
 from pathlib import Path, PureWindowsPath
 import subprocess
 import threading
@@ -11,6 +14,7 @@ from unittest.mock import Mock, patch
 from lib import physical_authority
 from lib.physical_authority import read_private, write_private
 from lib.physical_lifecycle import LifecycleMailbox, query_handoff
+from lib import physical_lifecycle
 from lib.request_admission import AdmissionError
 from fusion_bridge import runtime
 from _physical_test_support import descriptor
@@ -18,8 +22,10 @@ import test_physical_authority
 import test_admission_runtime
 
 
-class ReviewAuthorityRegressions(test_physical_authority.PhysicalOwnershipTests):
-    # Reuse fixtures, not inherited test cases.
+class ReviewAuthorityRegressions(unittest.TestCase):
+    setUp = test_physical_authority.PhysicalOwnershipTests.setUp
+    make_authority = test_physical_authority.PhysicalOwnershipTests.make_authority
+
     def test_broker_wsl_namespace_is_not_resolved_by_windows_receiver(self):
         request = descriptor(self.authority)
         request["brokerOwner"]["queueDirectory"] = "/home/kamil/fmcad/queue"
@@ -70,8 +76,30 @@ class ReviewAuthorityRegressions(test_physical_authority.PhysicalOwnershipTests)
         self.assertIsNone(self.authority._grant)
         self.assertEqual(read_private(mailbox.directory / "existing.result.json")["state"], "rejected")
 
+    def test_same_grant_publication_preserves_exact_bytes_and_inode(self):
+        output = self.directory / "same-grant.json"
+        request = descriptor(self.authority)
+        first = self.authority.publish_grant(request, output)
+        before, inode = output.read_bytes(), output.stat().st_ino
+        self.assertEqual(self.authority.publish_grant(request, output), first)
+        self.assertEqual(output.read_bytes(), before)
+        self.assertEqual(output.stat().st_ino, inode)
+
+    def test_semantically_equal_but_different_grant_bytes_are_not_rewritten(self):
+        output = self.directory / "different-bytes.json"
+        request = descriptor(self.authority)
+        grant = self.authority.issue(request)
+        output.write_text(json.dumps(grant, indent=2), encoding="utf-8")
+        output.chmod(0o600)
+        before, inode = output.read_bytes(), output.stat().st_ino
+        with self.assertRaises(AdmissionError):
+            self.authority.publish_grant(request, output)
+        self.assertEqual(output.read_bytes(), before)
+        self.assertEqual(output.stat().st_ino, inode)
+
     def test_authority_database_and_lease_paths_are_forbidden_outputs(self):
         mailbox = LifecycleMailbox(self.authority, Mock())
+        locked_empty_files = []
         for number, output in enumerate((
             self.authority.directory / "database.json",
             self.authority.directory / "authority.lease",
@@ -80,16 +108,37 @@ class ReviewAuthorityRegressions(test_physical_authority.PhysicalOwnershipTests)
         )):
             if not output.exists():
                 output.touch(mode=0o600)
-            before, inode = output.read_bytes(), output.stat().st_ino
+            info = output.stat()
+            locked = os.name == "nt" and output == self.authority.directory / "authority.lease"
+            # Windows byte-range locks deny reads even of this process's own
+            # empty lease. Check metadata while held and bytes after release.
+            before = None if locked else output.read_bytes()
+            if locked:
+                self.assertEqual(info.st_size, 0)
+                locked_empty_files.append(output)
             write_private(mailbox.directory / f"protected-{number}.request.json", dict(
                 operation="grant", request=descriptor(self.authority), output=str(output),
             ))
             mailbox.poll()
-            self.assertEqual(output.read_bytes(), before)
-            self.assertEqual(output.stat().st_ino, inode)
+            if before is not None:
+                self.assertEqual(output.read_bytes(), before)
+            self.assertEqual(output.stat().st_ino, info.st_ino)
+            self.assertEqual(output.stat().st_size, info.st_size)
+            self.assertEqual(output.stat().st_mtime_ns, info.st_mtime_ns)
             self.assertEqual(read_private(
                 mailbox.directory / f"protected-{number}.result.json",
             )["state"], "rejected")
+        self.assertIsNone(self.authority._grant)
+        self.authority.close()
+        for output in locked_empty_files:
+            self.assertEqual(output.read_bytes(), b"")
+
+    def test_absent_sqlite_sidecar_is_also_a_forbidden_grant_output(self):
+        output = Path(self.provision["database"] + "-wal")
+        self.assertFalse(output.exists())
+        with self.assertRaises(AdmissionError):
+            self.authority.publish_grant(descriptor(self.authority), output)
+        self.assertFalse(output.exists())
         self.assertIsNone(self.authority._grant)
 
     def test_two_writers_cannot_replace_a_published_file(self):
@@ -147,7 +196,13 @@ class ReviewAuthorityRegressions(test_physical_authority.PhysicalOwnershipTests)
         self.assertFalse(list(parent.glob(".write-*")))
 
 
-class ReviewRuntimeRegressions(test_admission_runtime.RuntimeAdmissionContracts):
+class ReviewRuntimeRegressions(unittest.TestCase):
+    setUp = test_admission_runtime.RuntimeAdmissionContracts.setUp
+    write_provision = test_admission_runtime.RuntimeAdmissionContracts.write_provision
+    start_runtime = test_admission_runtime.RuntimeAdmissionContracts.start_runtime
+    wait_until = test_admission_runtime.RuntimeAdmissionContracts.wait_until
+    generation = test_admission_runtime.RuntimeAdmissionContracts.generation
+
     def test_invalid_handoff_id_is_rejected_before_rundown(self):
         with patch.object(runtime, "_admission", Mock()):
             with patch.object(runtime, "_begin_rundown") as rundown:
@@ -164,27 +219,31 @@ class ReviewRuntimeRegressions(test_admission_runtime.RuntimeAdmissionContracts)
                        nextGeneration=dict(instance="addin", epoch="next"))
         mailbox = LifecycleMailbox(runtime._admission.physical, runtime.handoff_admission_generation)
         store = runtime._admission._store
+        input_path = self.file.parent / "handoff-input.json"
+        write_private(input_path, request)
         with patch.object(store, "advance_generation", wraps=store.advance_generation) as advance:
             with patch.object(runtime, "_retire", side_effect=RuntimeError("after committed CAS")):
-                for number in range(2):
-                    write_private(mailbox.directory / f"{number}.request.json",
-                                  dict(operation="handoff", request=request))
-                    mailbox.poll()
-                    result = read_private(mailbox.directory / f"{number}.result.json")
-                    self.assertEqual(result["state"], "unknown")
-                    receipt = query_handoff(self.database, "retire-failed")
-                    self.assertEqual(receipt["state"], "committed")
+                with patch.object(physical_lifecycle, "authority_directory",
+                                  return_value=mailbox.authority.directory):
+                    with patch.object(physical_lifecycle.time, "sleep",
+                                      side_effect=lambda _: mailbox.poll()):
+                        for _ in range(2):
+                            output = io.StringIO()
+                            with redirect_stdout(output):
+                                code = physical_lifecycle.main([
+                                    "handoff", "--request", str(input_path), "--timeout", "2",
+                                ])
+                            self.assertEqual(code, 3)
+                            self.assertEqual(json.loads(output.getvalue())["state"], "unknown")
+                            query_output = io.StringIO()
+                            with redirect_stdout(query_output):
+                                self.assertEqual(physical_lifecycle.main([
+                                    "query", "--database", str(self.database),
+                                    "--handoff-id", "retire-failed",
+                                ]), 0)
+                            self.assertEqual(json.loads(query_output.getvalue())["state"], "committed")
+                            self.assertEqual(query_handoff(
+                                self.database, "retire-failed",
+                            )["state"], "committed")
                 advance.assert_called_once()
         self.assertEqual(self.generation(), ("addin", "next"))
-
-
-# unittest discovers inherited methods too; these classes deliberately own only
-# the new regressions while borrowing fixture/helper methods from the old suites.
-for _class, _base in (
-    (ReviewAuthorityRegressions, test_physical_authority.PhysicalOwnershipTests),
-    (ReviewRuntimeRegressions, test_admission_runtime.RuntimeAdmissionContracts),
-):
-    for _name in _base.__dict__:
-        if _name.startswith("test_") and _name not in _class.__dict__:
-            setattr(_class, _name, None)
-del _class, _base, _name
