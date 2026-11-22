@@ -37,7 +37,7 @@ class HistoryStoreTests(unittest.TestCase):
                 )
         return copy.deepcopy(turn.binding)
 
-    def successor(self, epoch="new", handoff_id="h1"):
+    def successor(self, epoch="new", handoff_id="h1", *, issue=True):
         self.store.advance_generation(instance="runtime", epoch=epoch, handoff_id=handoff_id)
         self.authority.close()
         self.store.close()
@@ -48,7 +48,10 @@ class HistoryStoreTests(unittest.TestCase):
         self.authority = self.make_authority()
         request = descriptor(self.authority, owner="broker-" + epoch, queue="/queue/" + epoch)
         request["handoffId"] = handoff_id
-        self.current_grant = self.authority.issue(request)
+        if issue:
+            self.current_grant = self.authority.issue(request)
+        elif hasattr(self, "current_grant"):
+            del self.current_grant
         return self.authority
 
     def test_successor_reads_exact_original_proof_without_weakening_current_query(self):
@@ -62,6 +65,13 @@ class HistoryStoreTests(unittest.TestCase):
         binding = self.old_turn()
         original = self.authority.turn_status(binding)
         self.successor()
+        self.successor(epoch="third", handoff_id="h2")
+        self.assertEqual(self.authority.turn_history(binding), original)
+
+    def test_adjacent_native_chain_allows_an_ungranted_intermediate_generation(self):
+        binding = self.old_turn()
+        original = self.authority.turn_status(binding)
+        self.successor(issue=False)
         self.successor(epoch="third", handoff_id="h2")
         self.assertEqual(self.authority.turn_history(binding), original)
 
@@ -169,6 +179,105 @@ class HistoryStoreTests(unittest.TestCase):
         self.successor()
         self.successor(epoch="third", handoff_id="h2")
         self.store._db.execute("DELETE FROM physical_handoffs WHERE id='h1'")
+        self.assertEqual(self.authority.turn_history(binding), dict(state="unknown", binding=binding))
+
+    def test_shortcut_skipping_middle_generation_is_not_an_ancestor_proof(self):
+        binding = self.old_turn()
+        self.successor()
+        self.successor(epoch="third", handoff_id="h2")
+        # Keep the current owner's real h2 ID and target C, but forge A→C.
+        # This remains a well-shaped acyclic graph and must still be refused.
+        receipt = json.loads(self.store._db.execute(
+            "SELECT result FROM physical_handoffs WHERE id='h2'",
+        ).fetchone()[0])
+        receipt["generation"] = binding["generation"]
+        self.store._db.execute("DELETE FROM physical_handoffs WHERE id='h1'")
+        self.store._db.execute("UPDATE physical_handoffs SET result=? WHERE id='h2'", (_encode(receipt),))
+        self.assertEqual(self.authority.turn_history(binding), dict(state="unknown", binding=binding))
+
+    def test_current_generation_with_a_successor_edge_is_not_a_valid_tail(self):
+        binding = self.old_turn()
+        self.successor()
+        middle = dict(instance="runtime", epoch="new")
+        self.successor(epoch="third", handoff_id="h2")
+        current = dict(instance="runtime", epoch="third")
+        with self.store._transaction():
+            self.store._db.execute("DELETE FROM physical_handoffs")
+            self.store._db.executemany("INSERT INTO physical_handoffs VALUES (?,?)", (
+                ("h2", _encode(dict(handoffId="h2", generation=binding["generation"],
+                                   nextGeneration=current, state="committed"))),
+                ("after-current", _encode(dict(handoffId="after-current", generation=current,
+                                              nextGeneration=middle, state="committed"))),
+            ))
+        self.assertEqual(self.authority.turn_history(binding), dict(state="unknown", binding=binding))
+
+    def test_current_must_be_the_last_persisted_history_generation(self):
+        binding = self.old_turn()
+        self.successor()
+        self.store._db.execute("INSERT INTO generation_history VALUES ('runtime','after-current')")
+        self.assertEqual(self.authority.turn_history(binding), dict(state="unknown", binding=binding))
+
+    def test_consistent_renamed_receipt_id_must_match_current_grant_handoff_id(self):
+        binding = self.old_turn()
+        self.successor()
+        receipt = json.loads(self.store._db.execute(
+            "SELECT result FROM physical_handoffs WHERE id='h1'",
+        ).fetchone()[0])
+        receipt["handoffId"] = "renamed-current"
+        self.store._db.execute(
+            "UPDATE physical_handoffs SET id=?,result=? WHERE id='h1'",
+            ("renamed-current", _encode(receipt)),
+        )
+        self.assertEqual(self.authority.turn_history(binding), dict(state="unknown", binding=binding))
+
+    def test_middle_receipt_must_match_its_existing_target_owner_handoff_id(self):
+        binding = self.old_turn()
+        self.successor()
+        self.successor(epoch="third", handoff_id="h2")
+        receipt = json.loads(self.store._db.execute(
+            "SELECT result FROM physical_handoffs WHERE id='h1'",
+        ).fetchone()[0])
+        receipt["handoffId"] = "renamed-middle"
+        self.store._db.execute(
+            "UPDATE physical_handoffs SET id=?,result=? WHERE id='h1'",
+            ("renamed-middle", _encode(receipt)),
+        )
+        self.assertEqual(self.authority.turn_history(binding), dict(state="unknown", binding=binding))
+
+    def test_persisted_native_order_is_not_replaced_by_graph_or_name_order(self):
+        binding = self.old_turn()
+        self.successor()
+        self.successor(epoch="third", handoff_id="h2")
+        with self.store._transaction():
+            self.store._db.execute("UPDATE generation_history SET rowid=-1 WHERE epoch='old'")
+            self.store._db.execute("UPDATE generation_history SET rowid=1 WHERE epoch='new'")
+            self.store._db.execute("UPDATE generation_history SET rowid=2 WHERE rowid=-1")
+        self.assertEqual(self.authority.turn_history(binding), dict(state="unknown", binding=binding))
+
+    def test_missing_native_ordinal_is_not_backfilled(self):
+        binding = self.old_turn()
+        self.successor()
+        self.store._db.execute("UPDATE generation_history SET rowid=99 WHERE epoch='new'")
+        self.assertEqual(self.authority.turn_history(binding), dict(state="unknown", binding=binding))
+
+    def test_current_owner_must_remain_present_and_bound_to_actual_current_grant(self):
+        binding = self.old_turn()
+        self.successor()
+        receipt = json.loads(self.store._db.execute(
+            "SELECT result FROM physical_handoffs WHERE id='h1'",
+        ).fetchone()[0])
+        owner = json.loads(self.store._db.execute(
+            "SELECT binding FROM physical_owners WHERE generation=?",
+            (_encode(self.current_grant["generation"]),),
+        ).fetchone()[0])
+        receipt["handoffId"] = owner["handoffId"] = "coherently-renamed"
+        self.store._db.execute("UPDATE physical_handoffs SET id=?,result=? WHERE id='h1'",
+                               ("coherently-renamed", _encode(receipt)))
+        self.store._db.execute("UPDATE physical_owners SET binding=? WHERE generation=?",
+                               (_encode(owner), _encode(owner["generation"])))
+        self.assertEqual(self.authority.turn_history(binding), dict(state="unknown", binding=binding))
+        self.store._db.execute("DELETE FROM physical_owners WHERE generation=?",
+                               (_encode(owner["generation"]),))
         self.assertEqual(self.authority.turn_history(binding), dict(state="unknown", binding=binding))
 
     def test_cycle_is_refused_even_when_target_is_reached_before_cycle(self):

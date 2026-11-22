@@ -123,15 +123,28 @@ response is allowed only when:
 - native immutable `physical_handoffs` receipts prove the old generation is a
   strict ancestor of the current generation, using nonempty exact handoff IDs
   and `state: "committed"` records consistent with `generation_history`;
+- the native append-only `generation_history` ROWIDs retain contiguous CAS
+  insertion order starting at 1, and the actual current generation is its
+  last row. Every receipt edge must connect **adjacent** persisted generations,
+  and every adjacent edge from the requested ancestor to current must exist.
+  A shortcut over a middle generation or a successor of current is not proof;
+- each receipt ID matches its destination generation's stored owner grant
+  binding when one exists. The current owner record must be present and match
+  the complete actual current grant descriptor (excluding its token), and the
+  final incoming receipt ID must equal that current grant's `handoffId`;
 - the bounded lineage is unambiguous and has no cycles or spliced/duplicate
   parent/successor edges. At most 1024 handoff records and 1025 generation
-  history rows are examined; an over-limit history fails closed.
+  history/owner rows are examined; an over-limit history fails closed.
 
 Unproved lineage, a foreign/spliced binding, a current-generation binding,
 missing rows or old queued/active snapshots return `unknown` with no evidence.
 Malformed binding shapes return HTTP 400; missing, old or lost-current
 authentication returns HTTP 401. `turn-status` remains strict current-only.
-Unknown legacy lineage is not migrated or guessed.
+Unknown legacy lineage, missing ordinals, non-native order or missing grant
+references are not migrated, backfilled or inferred from generation names or
+an otherwise well-shaped graph. An intermediate generation may lack a broker
+owner if it never issued a grant; its adjacent committed transitions are still
+required.
 
 The historical evidence digest is **identical to the original release proof**:
 

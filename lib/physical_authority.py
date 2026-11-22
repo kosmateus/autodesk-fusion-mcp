@@ -414,7 +414,8 @@ class PhysicalAuthority:
             # Reuse selector validation only; the old binding must NOT be
             # reconstructed with the current grant/generation/runtime.
             self._validate_turn_selector(binding["turnId"], binding["target"])
-            return self._store.physical_turn_history(binding)
+            current_owner = {key: value for key, value in self._grant.items() if key != "token"}
+            return self._store.physical_turn_history(binding, current_owner=current_owner)
 
     def revoke(self):
         with self._lock:
