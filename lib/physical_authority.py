@@ -237,6 +237,7 @@ class PhysicalAuthority:
         self._lease = None
         self._store = store
         self._grant = None
+        self._activation = None
         self._revoked = False
         self.directory = private_directory(authority_directory())
         self.database = Path(provision["database"]).resolve()
@@ -257,11 +258,12 @@ class PhysicalAuthority:
                     raise AdmissionError("Host physical authority is bound to another database")
             else:
                 write_private(binding_path, binding)
+            self._store.register_physical_runtime(self._pins)
         except BaseException:
             self.close()
             raise
 
-    def issue(self, descriptor):
+    def issue(self, descriptor, *, activation=None):
         if (not isinstance(descriptor, dict) or set(descriptor) != {
             "kind", "version", "handoffId", "generation", "brokerOwner",
             "endpointURL", "physicalRuntime",
@@ -280,13 +282,14 @@ class PhysicalAuthority:
         with self._lock:
             if self._lease is None or self._revoked:
                 raise AdmissionError("Physical authority is retired")
-            self._store.bind_physical_owner(descriptor)
+            self._store.bind_physical_owner(descriptor, activation=activation)
             if self._grant is None:
                 self._grant = copy.deepcopy(descriptor)
                 self._grant["token"] = secrets.token_urlsafe(48)
+                self._activation = copy.deepcopy(activation)
             return copy.deepcopy(self._grant)
 
-    def publish_grant(self, descriptor, output):
+    def publish_grant(self, descriptor, output, *, activation=None):
         output = Path(output)
         if not output.is_absolute():
             raise AdmissionError("An absolute private grant output is required")
@@ -306,7 +309,7 @@ class PhysicalAuthority:
                     self._grant, sort_keys=True, allow_nan=False,
                 ).encode("utf-8"):
                     raise AdmissionError("Grant output already contains another file")
-            grant = self.issue(descriptor)
+            grant = self.issue(descriptor, activation=activation)
             try:
                 publish_private(output, grant)
             except FileExistsError:
@@ -331,6 +334,7 @@ class PhysicalAuthority:
                 ):
                     raise OSError("Physical lease path changed")
                 self._store.assert_current_generation()
+                self._store.assert_sdk_authority(self._activation)
             except (OSError, AdmissionError):
                 self._revoked = True
                 raise PermissionError("Physical authority fence lost") from None
