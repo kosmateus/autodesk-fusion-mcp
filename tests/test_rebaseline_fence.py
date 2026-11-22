@@ -332,6 +332,10 @@ os._exit(71)
         with self.assertRaises(AdmissionError):
             physical_authority._read_private_bytes(path)
 
+    def test_private_reader_preserves_missing_file_signal_for_private_mailbox(self):
+        with self.assertRaises(FileNotFoundError):
+            physical_authority._read_private_bytes(self.root / "not-yet-published.json")
+
     @unittest.skipUnless(os.name == "posix", "POSIX opened inode race")
     def test_private_reader_rejects_path_swap_or_same_inode_modification(self):
         _, path = self.operator()

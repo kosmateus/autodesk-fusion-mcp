@@ -157,14 +157,19 @@ def _read_private_bytes(path):
             return (value.st_dev, value.st_ino, value.st_mode, value.st_uid,
                     value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
 
-        if stamp(Path(path).lstat()) != stamp(info):
+        # Windows CRT fstat and pathname stat expose different identity/time
+        # representations. Do not mix those APIs: the actual Windows HANDLE is
+        # already frozen against write/delete and validated by file-info/ACL.
+        if os.name != "nt" and stamp(Path(path).lstat()) != stamp(info):
             raise AdmissionError("Private file pathname does not name the opened inode")
         if os.name == "nt":
             import msvcrt
             _check_windows_acl(None, handle=msvcrt.get_osfhandle(fd))
         with os.fdopen(fd, "rb", closefd=False) as stream:
             result = stream.read()
-        if stamp(os.fstat(fd)) != stamp(info) or stamp(Path(path).lstat()) != stamp(info):
+        if stamp(os.fstat(fd)) != stamp(info) or (
+            os.name != "nt" and stamp(Path(path).lstat()) != stamp(info)
+        ):
             raise AdmissionError("Private file changed while reading")
         if os.name == "nt":
             _check_windows_acl(None, handle=msvcrt.get_osfhandle(fd))
@@ -198,6 +203,8 @@ def _open_windows_private_reader(path):
     # GENERIC_READ | READ_CONTROL; SHARE_READ only; OPEN_EXISTING; OPEN_REPARSE_POINT.
     handle = kernel.CreateFileW(str(path), 0x80020000, 1, None, 3, 0x00200000, None)
     if handle == wintypes.HANDLE(-1).value:
+        if ctypes.get_last_error() in (2, 3):  # Preserve mailbox missing-file semantics.
+            raise FileNotFoundError(2, "Private file does not exist", str(path))
         raise AdmissionError("Cannot open stable private Windows file")
     try:
         info = FileInfo()
