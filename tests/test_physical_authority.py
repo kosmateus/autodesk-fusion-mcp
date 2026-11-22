@@ -22,6 +22,17 @@ from test_http_protocols import HTTPFixture, modern, sse_message
 
 
 class WindowsPrivateACLTests(unittest.TestCase):
+    def test_cpython_owner_rights_ace_is_bound_to_a_trusted_owner(self):
+        user = "S-1-5-21-offline-user"
+        for owner in (user, "S-1-5-32-544", "S-1-5-18"):
+            physical_authority._validate_windows_private_acl(
+                owner, user, ["S-1-5-18", "S-1-5-32-544", "S-1-3-4"],
+            )
+        with self.assertRaises(AdmissionError):
+            physical_authority._validate_windows_private_acl(
+                "S-1-5-21-foreign", user, ["S-1-3-4"],
+            )
+
     @unittest.skipUnless(os.name == "nt", "Actual Windows private directory ACL")
     def test_new_windows_private_directory_has_only_trusted_effective_principals(self):
         snapshot = []

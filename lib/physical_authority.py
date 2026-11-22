@@ -31,7 +31,13 @@ def _validate_windows_private_acl(owner, current, allowed_principals):
     # Elevated Windows processes create files owned by Administrators rather
     # than their TokenUser SID. These privileged principals already control
     # process memory; accepting their ownership does not authorize other users.
-    if owner not in trusted or any(principal not in trusted for principal in allowed_principals):
+    # CPython's Windows mkdir(0o700) uses OW (OWNER RIGHTS, S-1-3-4)
+    # rather than an explicit user ACE. OW grants only the already-checked
+    # object's owner, never an arbitrary other user.
+    if owner not in trusted or any(
+        principal not in trusted and principal != "S-1-3-4"
+        for principal in allowed_principals
+    ):
         raise AdmissionError("Private Windows owner and DACL required")
 
 
