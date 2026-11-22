@@ -273,7 +273,8 @@ class MCPServer:
                     return
                 parsed = urlparse(self.path)
                 self._physical_capability = None
-                if parsed.path in ("/mcp", "/admission/v1", "/physical/v1/turn-status") and server_ref.physical_authority is not None:
+                if parsed.path in ("/mcp", "/admission/v1", "/physical/v1/turn-status",
+                                   "/physical/v1/turn-history") and server_ref.physical_authority is not None:
                     from .physical_authority import HEADER
                     try:
                         self._physical_capability = server_ref.physical_authority.authenticate(
@@ -282,8 +283,8 @@ class MCPServer:
                     except PermissionError:
                         self._send_empty(401, close=True)
                         return
-                if parsed.path == "/physical/v1/turn-status" and server_ref.physical_authority is not None:
-                    self._handle_physical_turn_status()
+                if parsed.path in ("/physical/v1/turn-status", "/physical/v1/turn-history") and server_ref.physical_authority is not None:
+                    self._handle_physical_turn_status(history=parsed.path.endswith("/turn-history"))
                 elif parsed.path == "/mcp":
                     self._handle_mcp_post()
                 elif parsed.path == "/admission/v1" and server_ref.admission_api is not None:
@@ -293,7 +294,7 @@ class MCPServer:
                     # the next request on a keep-alive connection.
                     self._send_empty(404, close=True)
 
-            def _handle_physical_turn_status(self):
+            def _handle_physical_turn_status(self, *, history=False):
                 from .admission_json import decode_json
                 from .request_admission import AdmissionError
                 lengths = self.headers.get_all("Content-Length", [])
@@ -312,7 +313,9 @@ class MCPServer:
                         return
                     binding = decode_json(body.decode("utf-8"))
                     self._physical_capability.validate()
-                    result = server_ref.physical_authority.turn_status(binding)
+                    query = (server_ref.physical_authority.turn_history if history
+                             else server_ref.physical_authority.turn_status)
+                    result = query(binding)
                 except (AdmissionError, ValueError, UnicodeError):
                     self._send_empty(400, close=True)
                     return

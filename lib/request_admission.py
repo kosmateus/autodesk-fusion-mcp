@@ -26,6 +26,7 @@ def _encode(value):
 
 
 class AdmissionStore:
+    _MAX_HISTORY_HANDOFFS = 1024
     _FIELDS = {"version", "owner", "request", "instance", "epoch",
                "source", "build", "document", "inputHash"}
 
@@ -243,13 +244,133 @@ class AdmissionStore:
             ).fetchone()
             if row is None or row[0] != _encode(binding):
                 return result
-            result["state"] = "released" if row[1] == "released" else "active"
             if row[1] == "released":
-                evidence = dict(binding=binding, state="released", releasedBy=row[2])
-                digest = hashlib.sha256(_encode(evidence).encode("utf-8")).hexdigest()
-                result.update(physicalEvidenceReference="fmcad-physical-turn:sha256:" + digest,
-                              evidenceDigest=digest)
+                return self._released_turn_evidence(binding, row[2])
+            result["state"] = "active"
             return result
+
+    @staticmethod
+    def _released_turn_evidence(binding, reason):
+        evidence = dict(binding=binding, state="released", releasedBy=reason)
+        digest = hashlib.sha256(_encode(evidence).encode("utf-8")).hexdigest()
+        return dict(state="released", binding=binding,
+                    physicalEvidenceReference="fmcad-physical-turn:sha256:" + digest,
+                    evidenceDigest=digest)
+
+    def physical_turn_history(self, binding, *, current_owner):
+        """Read already-sealed ancestor evidence; never infer release or write."""
+        with self._lock:
+            self.assert_current_generation()
+            unknown = dict(state="unknown", binding=binding)
+            tables = self._db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name IN ('physical_turns','physical_handoffs','physical_owners')",
+            ).fetchall()
+            if len(tables) != 3:
+                return unknown
+            row = self._db.execute(
+                "SELECT binding,state,released_by FROM physical_turns WHERE id=?",
+                (binding["turnId"],),
+            ).fetchone()
+            if (row is None or row[0] != _encode(binding) or row[1] != "released"
+                    or row[2] not in ("dispatch-finally", "cancelled-before-sdk")
+                    or not self._committed_ancestor(binding["generation"], current_owner)):
+                return unknown
+            return self._released_turn_evidence(binding, row[2])
+
+    def _committed_ancestor(self, generation, current_owner):
+        current = (self._instance, self._epoch)
+        ancestor = (generation["instance"], generation["epoch"])
+        if ancestor == current or not isinstance(current_owner, dict):
+            return False
+        limit = self._MAX_HISTORY_HANDOFFS
+        rows = self._db.execute(
+            "SELECT id,result FROM physical_handoffs LIMIT ?", (limit + 1,),
+        ).fetchall()
+        # Native CAS appends generation_history in the SAME transaction as
+        # generation + handoff. Its persisted ROWID, not names or graph shape,
+        # supplies insertion order. Missing/reordered native evidence is not
+        # repaired or reconstructed by this read-only query.
+        try:
+            generations = self._db.execute(
+                "SELECT rowid,instance,epoch FROM generation_history ORDER BY rowid LIMIT ?",
+                (limit + 2,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return False  # No native persisted order: no legacy inference.
+        owner_rows = self._db.execute(
+            "SELECT generation,binding FROM physical_owners LIMIT ?", (limit + 2,),
+        ).fetchall()
+        if (len(rows) > limit or not generations or len(generations) > limit + 1
+                or len(owner_rows) > limit + 1
+                or [row[0] for row in generations] != list(range(1, len(generations) + 1))):
+            return False
+        ordered = [(row[1], row[2]) for row in generations]
+        if any(not isinstance(value, str) or not value for pin in ordered for value in pin):
+            return False
+        positions = {pin: index for index, pin in enumerate(ordered)}
+        if (len(positions) != len(ordered) or ancestor not in positions
+                or ordered[-1] != current):
+            return False
+        owners = {}
+        for encoded_generation, raw in owner_rows:
+            try:
+                pin, owner = json.loads(encoded_generation), json.loads(raw)
+                if (not isinstance(pin, dict) or set(pin) != {"instance", "epoch"}
+                        or any(not isinstance(value, str) or not value for value in pin.values())
+                        or _encode(pin) != encoded_generation or not isinstance(owner, dict)
+                        or set(owner) != {"kind", "version", "handoffId", "generation",
+                                         "brokerOwner", "endpointURL", "physicalRuntime"}
+                        or owner["kind"] != "fmcad-physical-grant"
+                        or type(owner["version"]) is not int or owner["version"] != 1
+                        or _encode(owner) != raw or owner.get("generation") != pin
+                        or not isinstance(owner.get("handoffId"), str) or not owner["handoffId"]):
+                    return False
+                key = (pin["instance"], pin["epoch"])
+                if key not in positions or key in owners:
+                    return False
+                owners[key] = (owner["handoffId"], raw)
+            except (ValueError, TypeError, KeyError):
+                return False
+        if current not in owners or owners[current][1] != _encode(current_owner):
+            return False
+        incoming, outgoing = {}, {}
+        for handoff_id, raw in rows:
+            try:
+                record = json.loads(raw)
+                if (not isinstance(record, dict) or set(record) != {
+                    "handoffId", "generation", "nextGeneration", "state",
+                } or record["state"] != "committed" or not isinstance(handoff_id, str)
+                        or not handoff_id or record["handoffId"] != handoff_id
+                        or _encode(record) != raw):
+                    return False
+                ends = []
+                for name in ("generation", "nextGeneration"):
+                    pin = record[name]
+                    if (not isinstance(pin, dict) or set(pin) != {"instance", "epoch"}
+                            or any(not isinstance(value, str) or not value for value in pin.values())):
+                        return False
+                    ends.append((pin["instance"], pin["epoch"]))
+                source, target = ends
+            except (ValueError, TypeError, KeyError):
+                return False
+            if (source not in positions or target not in positions
+                    or positions[target] != positions[source] + 1
+                    or source in outgoing or target in incoming):
+                return False
+            if target in owners and owners[target][0] != handoff_id:
+                return False
+            outgoing[source], incoming[target] = target, (source, handoff_id)
+        if (current in outgoing or current not in incoming
+                or incoming[current][1] != current_owner.get("handoffId")):
+            return False
+        # Require EVERY adjacent transition from the ancestor to the real tail.
+        # Forward-only adjacent edges also make cycles impossible.
+        for index in range(positions[ancestor] + 1, len(ordered)):
+            edge = incoming.get(ordered[index])
+            if edge is None or edge[0] != ordered[index - 1]:
+                return False
+        return True
 
     def _binding(self, binding):
         if not isinstance(binding, dict) or set(binding) != self._FIELDS:
