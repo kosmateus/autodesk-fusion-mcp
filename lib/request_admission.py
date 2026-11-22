@@ -113,7 +113,7 @@ class AdmissionStore:
             result = dict(handoffId=handoff_id,
                           generation=dict(instance=self._instance, epoch=self._epoch),
                           nextGeneration=dict(instance=instance, epoch=epoch),
-                          state="completed")
+                          state="committed")
             if handoff_id is not None:
                 previous = self._db.execute(
                     "SELECT result FROM physical_handoffs WHERE id=?", (handoff_id,),

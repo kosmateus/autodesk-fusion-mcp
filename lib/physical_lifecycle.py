@@ -11,7 +11,7 @@ import time
 from .physical_authority import (
     authority_directory, private_directory, read_private, write_private,
 )
-from .request_admission import AdmissionError
+from .request_admission import AdmissionError, GenerationUnchangedError
 
 
 def query_handoff(database, handoff_id):
@@ -43,22 +43,22 @@ class LifecycleMailbox:
             if result_path.exists():
                 continue
             operation = None
+            handoff_started = False
             try:
                 envelope = read_private(path)
                 operation = envelope["operation"]
                 request = envelope["request"]
                 if operation == "grant":
-                    grant = self.authority.issue(request)
                     output = Path(envelope["output"])
-                    if not output.is_absolute():
-                        raise AdmissionError("An absolute private grant output is required")
-                    write_private(output, grant)
+                    grant = self.authority.publish_grant(request, output)
                     result = dict(state="granted", handoffId=grant["handoffId"])
                 elif operation == "handoff":
                     if (set(request) != {"handoffId", "generation", "nextGeneration"}
+                            or not isinstance(request["handoffId"], str) or not request["handoffId"]
                             or request["generation"] != self.authority._pins["generation"]
                             or set(request["nextGeneration"]) != {"instance", "epoch"}):
                         raise AdmissionError("Exact handoff generation pins required")
+                    handoff_started = True
                     completed = self.handoff(
                         instance=request["nextGeneration"]["instance"],
                         epoch=request["nextGeneration"]["epoch"],
@@ -71,9 +71,13 @@ class LifecycleMailbox:
                     result = dict(state="completed", **request)
                 else:
                     raise AdmissionError("Unsupported private lifecycle operation")
-            except Exception:
+            except Exception as exc:
                 # No descriptor, token, path or request data in failure output.
-                result = dict(state="rejected", error="Private lifecycle request rejected")
+                if handoff_started and not isinstance(exc, GenerationUnchangedError):
+                    result = dict(state="unknown", handoffId=request["handoffId"],
+                                  retirement="unconfirmed", queryRequired=True)
+                else:
+                    result = dict(state="rejected", error="Private lifecycle request rejected")
                 if operation == "handoff" and self.retry is not None:
                     self.retry(self.poll)
             write_private(result_path, result)
@@ -117,7 +121,8 @@ def main(argv=None):
         if result_path.exists():
             result = read_private(result_path)
             print(json.dumps(result))
-            return 0 if result["state"] in ("granted", "completed") else 1
+            return (0 if result["state"] in ("granted", "completed")
+                    else 3 if result["state"] == "unknown" else 1)
         time.sleep(0.05)
     print(json.dumps(dict(state="pending", message="Query the same handoff ID; do not replay CAS")))
     return 3

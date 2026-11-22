@@ -41,6 +41,12 @@ Every `/mcp` and `/admission/v1` POST supplies exactly one
 configuration, or return it through MCP metadata. The broker must pin the
 entire descriptor to its exact process owner and canonical queue directory;
 an inherited descriptor is not authority for a successor broker.
+`queueDirectory` remains in the **broker's** namespace. A Linux/WSL broker
+uses its canonical POSIX path even when Fusion runs on Windows. The fork
+validates absolute lexical form (POSIX or native Windows), rejects aliases
+such as `..`, repeated separators and trailing separators, and preserves the
+exact string; it never resolves the path on the Fusion host. The broker
+independently checks its real queue directory and lock nonce.
 `brokerOwner.clientId` identifies the sole physical broker, **not** the logical
 request caller. Several logical clients may share that broker. Admission still
 authenticates each separate bearer principal and checks it against
@@ -112,6 +118,11 @@ The grant request contains the exact grant shape above **without `token`**.
 All runtime, endpoint and generation pins must match the provisioned runtime.
 A runtime issues at most one owner grant; a different owner needs a completed
 generation handoff. Repeating a request for that owner returns the same grant.
+Grant publication never overwrites an existing inode. An existing file is
+accepted only when it contains the exact bytes of this runtime's same grant.
+Authority/mailbox, admission database, SQLite sidecars and lease paths are
+forbidden outputs. On Windows the effective ACL of the empty temporary file
+is validated **before** writing the token, not inferred from its parent.
 
 The handoff request is:
 
@@ -128,6 +139,13 @@ directory, and prints only a token-free acknowledgement. A timeout is not
 permission to repeat a transition with a new ID. Query the same handoff ID.
 The handoff result is committed in the existing admission SQLite transaction
 alongside generation CAS. Queries are read-only and do not replay CAS.
+Missing, null and empty handoff IDs are rejected before rundown. The immutable
+query receipt has `state: "committed"`: this proves CAS, not successful
+retirement. Only a successful runtime retirement yields the CLI acknowledgement
+`state: "completed"`. An exception after handoff begins produces
+`{state:"unknown", handoffId, retirement:"unconfirmed", queryRequired:true}`
+(CLI exit 3), never a definitive rejection; query that same ID. The runtime
+does not attempt a second CAS after a committed or indeterminate transition.
 Receipts and claimed/UNKNOWN records are not rewritten.
 An old durable UNKNOWN is not an active physical lease: it neither blocks a
 new independent request nor prevents handoff once actual SDK/HTTP work drains.

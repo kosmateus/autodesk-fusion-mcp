@@ -147,7 +147,7 @@ class RuntimeAdmissionContracts(unittest.TestCase):
                 self.handler.notify(None)
             else:
                 self.assertFalse(runtime.handoff_admission_generation(
-                    instance="addin", epoch="next"))
+                    instance="addin", epoch="next", handoff_id="offline-bootstrap"))
         finally:
             thread.join(4)
         self.assertFalse(thread.is_alive())
@@ -258,7 +258,7 @@ class RuntimeAdmissionContracts(unittest.TestCase):
 
         def fail_after_claim():
             observed["handoff"] = runtime.handoff_admission_generation(
-                instance="addin", epoch="next")
+                instance="addin", epoch="next", handoff_id="offline-bootstrap")
             observed["generation"] = self.generation()
             observed["status"] = self.call("status", binding)
             other, payload = self.payload(request="blocked")
@@ -332,7 +332,8 @@ class RuntimeAdmissionContracts(unittest.TestCase):
         self.handler.notify(None)
         self.assertEqual(self.generation(), ("addin", "first"))
         self.assertEqual(self.call("withdraw", binding), (200, {"state": "withdrawn"}))
-        self.assertTrue(runtime.handoff_admission_generation(instance="addin", epoch="next"))
+        self.assertTrue(runtime.handoff_admission_generation(
+            instance="addin", epoch="next", handoff_id="offline-bootstrap"))
         read_target.assert_not_called()
 
     def assert_handoff_waits_for_signal(self, send):
@@ -343,7 +344,8 @@ class RuntimeAdmissionContracts(unittest.TestCase):
         worker.start()
         try:
             self.assertTrue(firing.wait(2))
-            self.assertFalse(runtime.handoff_admission_generation(instance="addin", epoch="next"))
+            self.assertFalse(runtime.handoff_admission_generation(
+                instance="addin", epoch="next", handoff_id="offline-bootstrap"))
             self.assertEqual(self.generation(), ("addin", "first"))
             self.app.unregisterCustomEvent.assert_not_called()
             with self.assertRaises(OSError):
@@ -352,7 +354,8 @@ class RuntimeAdmissionContracts(unittest.TestCase):
             release.set()
             worker.join(5)
         self.assertFalse(worker.is_alive())
-        self.assertTrue(runtime.handoff_admission_generation(instance="addin", epoch="next"))
+        self.assertTrue(runtime.handoff_admission_generation(
+            instance="addin", epoch="next", handoff_id="offline-bootstrap"))
         self.assertEqual(self.generation(), ("addin", "next"))
 
     def test_handoff_waits_for_legacy_signal(self):
@@ -416,7 +419,7 @@ class RuntimeAdmissionContracts(unittest.TestCase):
                 self.assertEqual(self.call("withdraw", binding), (200, {"state": "withdrawn"}))
                 with patch.object(runtime._admission, "advance_generation") as advance:
                     self.assertFalse(runtime.handoff_admission_generation(
-                        instance="addin", epoch="next"))
+                        instance="addin", epoch="next", handoff_id="offline-bootstrap"))
                     advance.assert_not_called()
                 self.assertEqual(self.generation(), ("addin", "first"))
                 self.assertEqual(self.call("admit", binding, encoded), (503, None))
@@ -429,7 +432,8 @@ class RuntimeAdmissionContracts(unittest.TestCase):
         self.assertEqual(self.call("status", binding), (200, {"state": "withdrawn"}))
         self.assertEqual(self.call("withdraw", after), (200, {"state": "withdrawn"}))
         self.assertEqual(self.call("admit", binding, encoded), (503, None))
-        self.assertTrue(runtime.handoff_admission_generation(instance="addin", epoch="next"))
+        self.assertTrue(runtime.handoff_admission_generation(
+            instance="addin", epoch="next", handoff_id="offline-bootstrap"))
         self.assertEqual(self.generation(), ("addin", "next"))
 
     def test_rejected_epoch_preserves_recovery_without_reopening_admit(self):
@@ -437,14 +441,16 @@ class RuntimeAdmissionContracts(unittest.TestCase):
         binding, encoded = self.payload()
         self.assertEqual(self.call("withdraw", binding), (200, {"state": "withdrawn"}))
         with self.assertRaisesRegex(ValueError, "reuse"):
-            runtime.handoff_admission_generation(instance="addin", epoch="first")
+            runtime.handoff_admission_generation(
+                instance="addin", epoch="first", handoff_id="offline-bootstrap")
         self.assertEqual(self.generation(), ("addin", "first"))
         self.assertEqual(self.call("status", binding), (200, {"state": "withdrawn"}))
         new, _ = self.payload(request="new")
         self.assertEqual(self.call("withdraw", new), (200, {"state": "withdrawn"}))
         self.assertEqual(self.call("admit", binding, encoded), (503, None))
         with self.assertRaisesRegex(ValueError, "required"):
-            runtime.handoff_admission_generation(instance="addin", epoch="")
+            runtime.handoff_admission_generation(
+                instance="addin", epoch="", handoff_id="offline-bootstrap")
         self.assertEqual(self.call("status", new), (200, {"state": "withdrawn"}))
 
     def test_indeterminate_transition_does_not_reopen_recovery(self):
@@ -460,9 +466,11 @@ class RuntimeAdmissionContracts(unittest.TestCase):
 
         with patch.object(store, "advance_generation", side_effect=lost_outcome) as transition:
             with self.assertRaisesRegex(sqlite3.OperationalError, "not observed"):
-                runtime.handoff_admission_generation(instance="addin", epoch="next")
+                runtime.handoff_admission_generation(
+                    instance="addin", epoch="next", handoff_id="offline-bootstrap")
             with self.assertRaisesRegex(ValueError, "outcome is unknown"):
-                runtime.handoff_admission_generation(instance="addin", epoch="next")
+                runtime.handoff_admission_generation(
+                    instance="addin", epoch="next", handoff_id="offline-bootstrap")
             transition.assert_called_once()
         self.assertEqual(self.generation(), ("addin", "next"))
         self.assertEqual(self.call("status", binding), (401, None))

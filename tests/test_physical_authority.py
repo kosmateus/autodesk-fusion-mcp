@@ -22,6 +22,23 @@ from test_http_protocols import HTTPFixture, modern, sse_message
 
 
 class WindowsPrivateACLTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Actual Windows private directory ACL")
+    def test_new_windows_private_directory_has_only_trusted_effective_principals(self):
+        snapshot = []
+        validate = physical_authority._validate_windows_private_acl
+
+        def capture(*args):
+            snapshot.append(args)
+            return validate(*args)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(physical_authority, "_validate_windows_private_acl",
+                              side_effect=capture):
+                try:
+                    physical_authority.private_directory(Path(directory) / "private")
+                except AdmissionError as exc:
+                    self.fail(f"New private directory ACL rejected: {exc}; ACL identities={snapshot}")
+
     def test_elevated_administrator_owner_with_private_dacl_is_valid(self):
         user = "S-1-5-21-offline-user"
         physical_authority._validate_windows_private_acl(

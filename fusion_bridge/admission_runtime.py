@@ -75,6 +75,7 @@ class AdmissionRuntime:
         self._store = None
         self.physical = None
         self._transition_uncertain = False
+        self._transition_committed = False
         try:
             self._store = AdmissionStore(database, instance=provision["instance"],
                                          epoch=provision["epoch"], create=False)
@@ -102,11 +103,18 @@ class AdmissionRuntime:
                    shutdown=shutdown, **kwargs)
 
     def advance_generation(self, *, instance, epoch, handoff_id=None):
+        if not isinstance(handoff_id, str) or not handoff_id:
+            raise GenerationUnchangedError("A nonempty handoff ID is required")
         if self._transition_uncertain:
             raise AdmissionError("Prior generation transition outcome is unknown")
+        if self._transition_committed:
+            raise AdmissionError("Prior handoff already committed; query the same handoff ID")
         try:
-            kwargs = {} if handoff_id is None else {"handoff_id": handoff_id}
-            return self._store.advance_generation(instance=instance, epoch=epoch, **kwargs)
+            result = self._store.advance_generation(
+                instance=instance, epoch=epoch, handoff_id=handoff_id,
+            )
+            self._transition_committed = True
+            return result
         except GenerationUnchangedError:
             raise
         except BaseException:

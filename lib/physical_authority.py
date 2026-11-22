@@ -6,7 +6,7 @@ import hashlib
 import hmac
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import secrets
 import stat
 import sys
@@ -121,6 +121,10 @@ def private_directory(path):
 
 
 def read_private(path):
+    return json.loads(_read_private_bytes(path).decode("utf-8"))
+
+
+def _read_private_bytes(path):
     """No symlink following; validate the opened inode rather than a prior stat."""
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
@@ -130,23 +134,39 @@ def read_private(path):
         ) or Path(path).is_symlink():
             raise AdmissionError("A private regular file is required")
         _check_windows_acl(path)
-        with os.fdopen(fd, "r", encoding="utf-8", closefd=False) as stream:
-            return json.load(stream)
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            return stream.read()
     finally:
         os.close(fd)
 
 
 def write_private(path, value):
+    _write_private(path, value, replace=True)
+
+
+def publish_private(path, value):
+    """Atomically publish without replacing any inode, including symlinks."""
+    _write_private(path, value, replace=False)
+
+
+def _write_private(path, value, *, replace):
     path = Path(path)
     private_directory(path.parent)
     temporary = path.parent / (".write-" + secrets.token_hex(16))
     fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     try:
+        # An effectively private parent may still grant public access through
+        # INHERIT_ONLY ACEs. Validate the empty child before writing any secret.
+        _check_windows_acl(temporary)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            fd = None  # fdopen owns the descriptor from this point.
             json.dump(value, stream, sort_keys=True, allow_nan=False)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        if replace:
+            os.replace(temporary, path)
+        else:
+            os.link(temporary, path)
         if os.name != "nt":
             directory_fd = os.open(path.parent, os.O_RDONLY)
             try:
@@ -154,8 +174,22 @@ def write_private(path, value):
             finally:
                 os.close(directory_fd)
     finally:
+        if fd is not None:
+            os.close(fd)
         if temporary.exists():
             temporary.unlink()
+
+
+def _canonical_broker_queue(value):
+    """Lexical broker namespace validation, never receiver-host resolution."""
+    if not isinstance(value, str) or not value or "\0" in value:
+        return False
+    if value.startswith("/"):
+        path = PurePosixPath(value)
+        return (not value.startswith("//") and path.is_absolute()
+                and str(path) == value and ".." not in path.parts)
+    path = PureWindowsPath(value)
+    return (path.is_absolute() and str(path) == value and ".." not in path.parts)
 
 
 class PhysicalCapability:
@@ -199,6 +233,7 @@ class PhysicalAuthority:
         self._grant = None
         self._revoked = False
         self.directory = private_directory(authority_directory())
+        self.database = Path(provision["database"]).resolve()
         self._pins = dict(
             generation=dict(instance=provision["instance"], epoch=provision["epoch"]),
             endpointURL=endpoint,
@@ -234,8 +269,7 @@ class PhysicalAuthority:
             "pid", "birth", "nonce", "clientId", "queueDirectory",
         } or type(owner["pid"]) is not int or owner["pid"] <= 0
                 or any(not isinstance(owner[k], str) or not owner[k] for k in owner.keys() - {"pid"})
-                or not Path(owner["queueDirectory"]).is_absolute()
-                or str(Path(owner["queueDirectory"]).resolve()) != owner["queueDirectory"]):
+                or not _canonical_broker_queue(owner["queueDirectory"])):
             raise AdmissionError("Exact physical broker owner is required")
         with self._lock:
             if self._lease is None or self._revoked:
@@ -245,6 +279,36 @@ class PhysicalAuthority:
                 self._grant = copy.deepcopy(descriptor)
                 self._grant["token"] = secrets.token_urlsafe(48)
             return copy.deepcopy(self._grant)
+
+    def publish_grant(self, descriptor, output):
+        output = Path(output)
+        if not output.is_absolute():
+            raise AdmissionError("An absolute private grant output is required")
+        canonical = output.resolve()
+        protected = {Path(str(self.database) + suffix) for suffix in (
+            "", ".lease", "-wal", "-shm", "-journal",
+        )}
+        if (canonical in protected or canonical == self.directory.resolve()
+                or self.directory.resolve() in canonical.parents):
+            raise AdmissionError("Grant output cannot name lifecycle, database or lease files")
+        private_directory(output.parent)
+        with self._lock:
+            # Check existing data before binding an owner. A raced publication
+            # is still protected by the hard-link no-replace commit below.
+            if os.path.lexists(output):
+                if self._grant is None or _read_private_bytes(output) != json.dumps(
+                    self._grant, sort_keys=True, allow_nan=False,
+                ).encode("utf-8"):
+                    raise AdmissionError("Grant output already contains another file")
+            grant = self.issue(descriptor)
+            try:
+                publish_private(output, grant)
+            except FileExistsError:
+                if _read_private_bytes(output) != json.dumps(
+                    grant, sort_keys=True, allow_nan=False,
+                ).encode("utf-8"):
+                    raise AdmissionError("Grant output publication lost a race") from None
+            return grant
 
     def authenticate(self, values):
         with self._lock:

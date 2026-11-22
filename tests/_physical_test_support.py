@@ -16,7 +16,7 @@ def descriptor(authority, *, queue="/offline/queue", owner="owner"):
     return dict(
         kind="fmcad-physical-grant", version=1, handoffId="offline-bootstrap",
         brokerOwner=dict(pid=os.getpid(), birth="offline-birth", nonce="offline-nonce",
-                         clientId=owner, queueDirectory=str(Path(queue).resolve())),
+                         clientId=owner, queueDirectory=queue),
         **copy.deepcopy(authority._pins),
     )
 

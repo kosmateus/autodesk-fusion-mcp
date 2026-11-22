@@ -276,6 +276,8 @@ def _retire():
 def handoff_admission_generation(*, instance, epoch, handoff_id=None):
     """Explicit trusted handoff; False means retry after outstanding work settles."""
     _require_main_thread()
+    if not isinstance(handoff_id, str) or not handoff_id:
+        raise GenerationUnchangedError("A nonempty handoff ID is required before rundown")
     if _admission is None:
         raise RuntimeError("No admission runtime to hand off")
     if _host_stop is not None or not _begin_rundown():
@@ -286,8 +288,7 @@ def handoff_admission_generation(*, instance, epoch, handoff_id=None):
         if not _seal_if_idle():
             return False
         try:
-            kwargs = {} if handoff_id is None else {"handoff_id": handoff_id}
-            _admission.advance_generation(instance=instance, epoch=epoch, **kwargs)
+            _admission.advance_generation(instance=instance, epoch=epoch, handoff_id=handoff_id)
         except GenerationUnchangedError:
             _admission.http.restore_recovery()
             raise
