@@ -21,6 +21,7 @@ from .dispatch import (
     init_main_thread_dispatch,
     log,
     set_tool_handler,
+    set_lifecycle_poll,
     stop_main_thread_dispatch,
     wait_for_main_thread,
     request_main_thread_shutdown,
@@ -31,6 +32,7 @@ _server = None
 _admission = None
 _server_lock = threading.Lock()
 _host_stop = None
+_sdk_version = "unknown"
 
 
 def handle_any_tool(call_data):
@@ -63,7 +65,7 @@ def handle_any_tool(call_data):
         log(f"[MCP] {tool_name} {status} in {format_duration(elapsed_ms)}")
 
 
-def create_server(dispatch, *, admission_api=None):
+def create_server(dispatch, *, admission_api=None, physical_authority=None):
     from . import operations
 
     set_tool_handler(handle_any_tool)
@@ -76,6 +78,7 @@ def create_server(dispatch, *, admission_api=None):
         },
         log_callback=log,
         admission_api=admission_api,
+        physical_authority=physical_authority,
     )
 
     server.resources.append(
@@ -108,9 +111,13 @@ def _start_server(shutdown_flag):
     log(f"Starting MCP server on port {settings.MCP_SERVER_PORT}...")
     attempt = 0
     dispatch = bind_dispatch(shutdown_flag)
-    admission = AdmissionRuntime.from_environment(dispatch, shutdown=shutdown_flag)
+    admission = AdmissionRuntime.from_environment(
+        dispatch, shutdown=shutdown_flag, version=_sdk_version,
+        endpoint=f"http://127.0.0.1:{settings.MCP_SERVER_PORT}/mcp",
+    )
     try:
-        server = create_server(dispatch, admission_api=admission.http if admission else None)
+        server = create_server(dispatch, admission_api=admission.http if admission else None,
+                               physical_authority=admission.physical if admission else None)
     except BaseException:
         if admission is not None:
             admission.close()
@@ -128,6 +135,11 @@ def _listen(server, admission, shutdown_flag, attempt):
         try:
             server.start()
             _server, _admission = server, admission
+            if admission is not None:
+                from ..lib.physical_lifecycle import LifecycleMailbox
+                mailbox = LifecycleMailbox(admission.physical, handoff_admission_generation,
+                                            retry=defer_main_thread_retirement)
+                set_lifecycle_poll(mailbox.poll)
             break
         except OSError as exc:
             if "Address already in use" not in str(exc):
@@ -188,10 +200,12 @@ def _server_start_worker(shutdown_flag=None):
 
 
 def start():
+    global _sdk_version
     _require_main_thread()
     version_info = python_exec.get_version_info(python_exec.get_addin_dir())
     log(f"MCP Integration starting... add-in {version_info}")
     fusion_version = getattr(adsk.core.Application.get(), "version", "unknown")
+    _sdk_version = str(fusion_version)
     log(f"Runtime: Autodesk Fusion {fusion_version}; Python {platform.python_version()}")
 
     try:
@@ -256,11 +270,14 @@ def _retire():
     if _admission:
         _admission.close()
         _admission = None
+    set_lifecycle_poll(None)
 
 
-def handoff_admission_generation(*, instance, epoch):
+def handoff_admission_generation(*, instance, epoch, handoff_id=None):
     """Explicit trusted handoff; False means retry after outstanding work settles."""
     _require_main_thread()
+    if not isinstance(handoff_id, str) or not handoff_id:
+        raise GenerationUnchangedError("A nonempty handoff ID is required before rundown")
     if _admission is None:
         raise RuntimeError("No admission runtime to hand off")
     if _host_stop is not None or not _begin_rundown():
@@ -271,10 +288,14 @@ def handoff_admission_generation(*, instance, epoch):
         if not _seal_if_idle():
             return False
         try:
-            _admission.advance_generation(instance=instance, epoch=epoch)
+            _admission.advance_generation(instance=instance, epoch=epoch, handoff_id=handoff_id)
         except GenerationUnchangedError:
             _admission.http.restore_recovery()
             raise
+        except BaseException:
+            _admission.physical.revoke()
+            raise
+        _admission.physical.revoke()
         _retire()
     finally:
         _server_lock.release()

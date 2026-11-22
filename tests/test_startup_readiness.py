@@ -160,6 +160,8 @@ class StartupPingTests(unittest.TestCase):
 
 class DispatchTimeoutTests(unittest.TestCase):
     def setUp(self):
+        from _physical_test_support import authorize_offline_dispatch
+        authorize_offline_dispatch(self)
         self._original_get_app = dispatch.get_app
         self._original_timeout = settings.MCP_MAIN_THREAD_TIMEOUT
         dispatch.get_app = lambda: _FakeApp()
@@ -359,6 +361,8 @@ class CancelNotificationHttpTests(unittest.TestCase):
     """End-to-end: notifications/cancelled wakes a queued tools/call over HTTP."""
 
     def setUp(self):
+        from _physical_test_support import authorize_offline_dispatch
+        authorize_offline_dispatch(self)
         self._original_get_app = dispatch.get_app
         self._original_cb = dispatch._callback_impl
         self._original_timeout = settings.MCP_MAIN_THREAD_TIMEOUT

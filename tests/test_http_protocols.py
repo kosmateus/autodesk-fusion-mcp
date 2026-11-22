@@ -397,6 +397,8 @@ class ProtocolHTTPTests(HTTPFixture, unittest.TestCase):
 
 class CancellationHTTPTests(HTTPFixture, unittest.TestCase):
     def setUp(self):
+        from _physical_test_support import authorize_offline_dispatch
+        authorize_offline_dispatch(self)
         self.queue = queue.Queue()
         self.halt = threading.Event()
         for name, value in (("_pending", self.queue), ("_halt", self.halt),

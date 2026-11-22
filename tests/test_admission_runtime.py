@@ -3,6 +3,7 @@
 import _fusion_test_bootstrap  # noqa: F401
 from contextlib import closing
 import hashlib
+import base64
 import http.client
 import json
 import os
@@ -29,6 +30,9 @@ class RuntimeAdmissionContracts(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.file = Path(temp.name) / "provision.json"
+        from lib import physical_authority
+        self.enterContext(patch.object(physical_authority, "authority_directory",
+                                      return_value=Path(temp.name) / "physical"))
         self.database = Path(temp.name) / "requests.sqlite"
         self.token = "test-token-" + "a" * 32
         self.provision = dict(
@@ -51,7 +55,7 @@ class RuntimeAdmissionContracts(unittest.TestCase):
     def write_provision(self):
         self.file.write_text(json.dumps(self.provision), encoding="utf-8")
 
-    def start_runtime(self, *, wait_for_starter=True):
+    def start_runtime(self, *, wait_for_starter=True, broker_owner="owner"):
         if "FUSION_MCP_ADMISSION_PROVISION" in os.environ and not self.database.exists():
             with admission_runtime.AdmissionStore(
                 self.database, instance=self.provision["instance"], epoch=self.provision["epoch"],
@@ -68,6 +72,13 @@ class RuntimeAdmissionContracts(unittest.TestCase):
         if wait_for_starter:
             self.wait_until(lambda: not runtime._server_lock.locked())
         self.port = runtime._server.httpd.server_address[1]
+        self.grant_token = None
+        if runtime._admission is not None:
+            from _physical_test_support import descriptor
+            grant = runtime._admission.physical.issue(descriptor(
+                runtime._admission.physical, owner=broker_owner,
+            ))
+            self.grant_token = grant["token"]
         self.app.fireCustomEvent.reset_mock(side_effect=True)
 
     def wait_until(self, predicate):
@@ -93,8 +104,15 @@ class RuntimeAdmissionContracts(unittest.TestCase):
             message = dict(version=1, operation=operation, binding=binding)
             if encoded is not None:
                 message["payloadJson"] = encoded
-            conn.request("POST", "/admission/v1", json.dumps(message),
-                         {"Authorization": "Bearer " + self.token})
+            headers = {"Authorization": "Bearer " + self.token}
+            if getattr(self, "grant_token", None):
+                headers["X-Fmcad-Physical-Grant"] = self.grant_token
+                if operation == "admit":
+                    headers["X-Fmcad-Physical-Turn"] = binding["request"]
+                    headers["X-Fmcad-Physical-Target"] = base64.urlsafe_b64encode(
+                        binding["document"].encode("utf-8"),
+                    ).decode().rstrip("=")
+            conn.request("POST", "/admission/v1", json.dumps(message), headers)
             response = conn.getresponse()
             body = response.read()
             return response.status, json.loads(body)["record"] if body else None
@@ -129,7 +147,7 @@ class RuntimeAdmissionContracts(unittest.TestCase):
                 self.handler.notify(None)
             else:
                 self.assertFalse(runtime.handoff_admission_generation(
-                    instance="addin", epoch="next"))
+                    instance="addin", epoch="next", handoff_id="offline-bootstrap"))
         finally:
             thread.join(4)
         self.assertFalse(thread.is_alive())
@@ -187,6 +205,21 @@ class RuntimeAdmissionContracts(unittest.TestCase):
         read_active.assert_not_called()
         self.app.fireCustomEvent.assert_called_once()
 
+    def test_broker_owner_is_separate_from_each_authenticated_admission_beneficiary(self):
+        other_token = "other-token-" + "b" * 32
+        self.provision["credentials"][other_token] = "other-beneficiary"
+        self.write_provision()
+        self.start_runtime(broker_owner="sole-physical-broker")
+        target, read_target = self.document()
+        self.app.documents = [target]
+        binding, encoded = self.payload()
+        self.assertEqual(self.admit(binding, encoded)[1]["state"], "terminal")
+        read_target.assert_called_once()
+        self.token = other_token
+        self.assertEqual(self.call("status", binding)[0], 400)
+        read_target.assert_called_once()
+        self.app.fireCustomEvent.assert_called_once()
+
     def test_dynamic_tools_and_invalid_selectors_are_refused_before_enqueue(self):
         self.start_runtime()
         for name, arguments in [
@@ -225,7 +258,7 @@ class RuntimeAdmissionContracts(unittest.TestCase):
 
         def fail_after_claim():
             observed["handoff"] = runtime.handoff_admission_generation(
-                instance="addin", epoch="next")
+                instance="addin", epoch="next", handoff_id="offline-bootstrap")
             observed["generation"] = self.generation()
             observed["status"] = self.call("status", binding)
             other, payload = self.payload(request="blocked")
@@ -238,7 +271,8 @@ class RuntimeAdmissionContracts(unittest.TestCase):
                                         status=(200, {"state": "unknown"}), new=(503, None)))
         old_dispatch = dispatch.bind_dispatch()
         old_handler = self.handler
-        self.assertTrue(runtime.handoff_admission_generation(instance="addin", epoch="next"))
+        self.assertTrue(runtime.handoff_admission_generation(
+            instance="addin", epoch="next", handoff_id="offline-bootstrap"))
         self.assertEqual(self.generation(), ("addin", "next"))
         with closing(sqlite3.connect(self.database)) as db:
             self.assertEqual(db.execute(
@@ -254,6 +288,38 @@ class RuntimeAdmissionContracts(unittest.TestCase):
             flush.assert_not_called()
         read_target.assert_called_once()
 
+    def test_historical_unknown_does_not_block_independent_document_or_handoff(self):
+        self.start_runtime()
+        first, read_first = self.document()
+        self.app.documents = [first]
+        binding, encoded = self.payload()
+        read_first.side_effect = RuntimeError("No durable terminal observation")
+        self.assertEqual(self.admit(binding, encoded), (200, {"state": "unknown"}))
+        physical = runtime._admission.physical
+        proof = physical.turn_status(physical._turn_binding(binding["request"], binding["document"]))
+        self.assertEqual(proof["state"], "released")
+        self.assertIn("evidenceDigest", proof)
+        second, read_second = self.document(creation_id="independent", file_id="other-file")
+        self.app.documents.append(second)
+        other_binding, other_payload = self.payload(
+            request="independent-request",
+            arguments={"fileId": "other-file", "version": 2},
+            document='{"creationId":"independent","fileId":"other-file","version":2}',
+        )
+        status, result = self.admit(other_binding, other_payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(result["state"], "terminal")
+        read_first.assert_called_once()
+        read_second.assert_called_once()
+        self.assertEqual(self.call("admit", binding, encoded), (200, {"state": "unknown"}))
+        read_first.assert_called_once()
+        self.assertTrue(runtime.handoff_admission_generation(
+            instance="addin", epoch="next", handoff_id="independent-handoff"))
+        with closing(sqlite3.connect(self.database)) as db:
+            self.assertEqual(db.execute(
+                "SELECT state FROM admissions WHERE request='request'",
+            ).fetchone(), ("claimed",))
+
     def test_handoff_rejects_queued_work_and_retires_after_http_rundown(self):
         self.start_runtime()
         binding, encoded = self.payload()
@@ -266,7 +332,8 @@ class RuntimeAdmissionContracts(unittest.TestCase):
         self.handler.notify(None)
         self.assertEqual(self.generation(), ("addin", "first"))
         self.assertEqual(self.call("withdraw", binding), (200, {"state": "withdrawn"}))
-        self.assertTrue(runtime.handoff_admission_generation(instance="addin", epoch="next"))
+        self.assertTrue(runtime.handoff_admission_generation(
+            instance="addin", epoch="next", handoff_id="offline-bootstrap"))
         read_target.assert_not_called()
 
     def assert_handoff_waits_for_signal(self, send):
@@ -277,7 +344,8 @@ class RuntimeAdmissionContracts(unittest.TestCase):
         worker.start()
         try:
             self.assertTrue(firing.wait(2))
-            self.assertFalse(runtime.handoff_admission_generation(instance="addin", epoch="next"))
+            self.assertFalse(runtime.handoff_admission_generation(
+                instance="addin", epoch="next", handoff_id="offline-bootstrap"))
             self.assertEqual(self.generation(), ("addin", "first"))
             self.app.unregisterCustomEvent.assert_not_called()
             with self.assertRaises(OSError):
@@ -286,7 +354,8 @@ class RuntimeAdmissionContracts(unittest.TestCase):
             release.set()
             worker.join(5)
         self.assertFalse(worker.is_alive())
-        self.assertTrue(runtime.handoff_admission_generation(instance="addin", epoch="next"))
+        self.assertTrue(runtime.handoff_admission_generation(
+            instance="addin", epoch="next", handoff_id="offline-bootstrap"))
         self.assertEqual(self.generation(), ("addin", "next"))
 
     def test_handoff_waits_for_legacy_signal(self):
@@ -350,7 +419,7 @@ class RuntimeAdmissionContracts(unittest.TestCase):
                 self.assertEqual(self.call("withdraw", binding), (200, {"state": "withdrawn"}))
                 with patch.object(runtime._admission, "advance_generation") as advance:
                     self.assertFalse(runtime.handoff_admission_generation(
-                        instance="addin", epoch="next"))
+                        instance="addin", epoch="next", handoff_id="offline-bootstrap"))
                     advance.assert_not_called()
                 self.assertEqual(self.generation(), ("addin", "first"))
                 self.assertEqual(self.call("admit", binding, encoded), (503, None))
@@ -363,7 +432,8 @@ class RuntimeAdmissionContracts(unittest.TestCase):
         self.assertEqual(self.call("status", binding), (200, {"state": "withdrawn"}))
         self.assertEqual(self.call("withdraw", after), (200, {"state": "withdrawn"}))
         self.assertEqual(self.call("admit", binding, encoded), (503, None))
-        self.assertTrue(runtime.handoff_admission_generation(instance="addin", epoch="next"))
+        self.assertTrue(runtime.handoff_admission_generation(
+            instance="addin", epoch="next", handoff_id="offline-bootstrap"))
         self.assertEqual(self.generation(), ("addin", "next"))
 
     def test_rejected_epoch_preserves_recovery_without_reopening_admit(self):
@@ -371,14 +441,16 @@ class RuntimeAdmissionContracts(unittest.TestCase):
         binding, encoded = self.payload()
         self.assertEqual(self.call("withdraw", binding), (200, {"state": "withdrawn"}))
         with self.assertRaisesRegex(ValueError, "reuse"):
-            runtime.handoff_admission_generation(instance="addin", epoch="first")
+            runtime.handoff_admission_generation(
+                instance="addin", epoch="first", handoff_id="offline-bootstrap")
         self.assertEqual(self.generation(), ("addin", "first"))
         self.assertEqual(self.call("status", binding), (200, {"state": "withdrawn"}))
         new, _ = self.payload(request="new")
         self.assertEqual(self.call("withdraw", new), (200, {"state": "withdrawn"}))
         self.assertEqual(self.call("admit", binding, encoded), (503, None))
         with self.assertRaisesRegex(ValueError, "required"):
-            runtime.handoff_admission_generation(instance="addin", epoch="")
+            runtime.handoff_admission_generation(
+                instance="addin", epoch="", handoff_id="offline-bootstrap")
         self.assertEqual(self.call("status", new), (200, {"state": "withdrawn"}))
 
     def test_indeterminate_transition_does_not_reopen_recovery(self):
@@ -394,13 +466,15 @@ class RuntimeAdmissionContracts(unittest.TestCase):
 
         with patch.object(store, "advance_generation", side_effect=lost_outcome) as transition:
             with self.assertRaisesRegex(sqlite3.OperationalError, "not observed"):
-                runtime.handoff_admission_generation(instance="addin", epoch="next")
+                runtime.handoff_admission_generation(
+                    instance="addin", epoch="next", handoff_id="offline-bootstrap")
             with self.assertRaisesRegex(ValueError, "outcome is unknown"):
-                runtime.handoff_admission_generation(instance="addin", epoch="next")
+                runtime.handoff_admission_generation(
+                    instance="addin", epoch="next", handoff_id="offline-bootstrap")
             transition.assert_called_once()
         self.assertEqual(self.generation(), ("addin", "next"))
-        self.assertEqual(self.call("status", binding), (503, None))
-        self.assertEqual(self.call("withdraw", binding), (503, None))
+        self.assertEqual(self.call("status", binding), (401, None))
+        self.assertEqual(self.call("withdraw", binding), (401, None))
 
     def test_old_ready_starter_cannot_publish_after_stop_and_restart(self):
         old_after_ping, release, old_exited = (

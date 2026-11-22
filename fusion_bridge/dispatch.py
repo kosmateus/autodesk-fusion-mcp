@@ -13,6 +13,7 @@ import adsk.core
 from .. import settings
 from ..lib import fusionAddInUtils as futil
 from ..lib.admission_receiver import AdmissionTargetError
+from ..lib.physical_authority import PhysicalCapability, PhysicalTurn
 
 # ── Module state ──────────────────────────────────────────────────────────
 
@@ -26,6 +27,12 @@ _lifecycle_lock = threading.Lock()
 _running_handlers = 0
 _running_signals = 0
 _deferred_retirement = None
+_lifecycle_poll = None
+
+
+def set_lifecycle_poll(callback):
+    global _lifecycle_poll
+    _lifecycle_poll = callback
 
 
 @dataclass
@@ -277,6 +284,19 @@ def dispatch_to_main_thread(call_data, *, admission_consumer=None):
 
 
 def _submit(shutdown, call_data, admission_consumer):
+    turn = call_data.get("_physical_turn") if isinstance(call_data, dict) else None
+    try:
+        return _submit_impl(shutdown, call_data, admission_consumer)
+    finally:
+        if isinstance(turn, PhysicalTurn):
+            try:
+                turn.cancel_queued()
+            except Exception:
+                # Missing durable release is conservative: status stays active.
+                pass
+
+
+def _submit_impl(shutdown, call_data, admission_consumer):
     cancel_event = (
         call_data.get("_cancel_event") if isinstance(call_data, dict) else None
     )
@@ -368,7 +388,18 @@ def _execute(shutdown, payload, consumer):
             raise RuntimeError("Tool implementation is not initialized")
         _running_handlers += 1
     try:
-        return consumer(handler) if consumer is not None else handler(payload)
+        capability = payload.get("_physical_capability") if isinstance(payload, dict) else None
+        if not isinstance(capability, PhysicalCapability):
+            raise PermissionError("Physical grant required before SDK dispatch")
+        capability.validate()
+        turn = payload.get("_physical_turn")
+        if not isinstance(turn, PhysicalTurn) or turn.capability is not capability:
+            raise PermissionError("Bound physical turn required before SDK dispatch")
+        turn.start()
+        try:
+            return consumer(handler) if consumer is not None else handler(payload)
+        finally:
+            turn.finish()
     finally:
         with _lifecycle_lock:
             _running_handlers -= 1
@@ -486,6 +517,8 @@ def _flush_pending():
         return
     try:
         drain_logs()
+        if _lifecycle_poll is not None:
+            _lifecycle_poll()
         processed = 0
         while processed < _BATCH_LIMIT:
             try:

@@ -135,6 +135,16 @@ class ModernHTTPMixin:
         cancelled = threading.Event()
         done = threading.Event()
         outcome = []
+        physical_capability = getattr(self, "_physical_capability", None)
+        physical_turn = None
+        if server.physical_authority is not None:
+            try:
+                physical_turn = server.physical_authority.turn_from_headers(
+                    physical_capability, self.headers,
+                )
+            except Exception:
+                server._tool_slots.release()
+                raise ProtocolError(-32602, "Current private physical turn headers required")
 
         def run():
             try:
@@ -142,12 +152,19 @@ class ModernHTTPMixin:
                     result = handler({
                         "params": {"name": name, "arguments": arguments},
                         "_cancel_event": cancelled,
+                        "_physical_capability": physical_capability,
+                        "_physical_turn": physical_turn,
                     })
                     outcome.append(result)
             except Exception as exc:
                 server.log(f"Tool {name} failed: {exc}")
                 outcome.append(self._tool_error(f"Tool execution failed: {exc}"))
             finally:
+                if physical_turn is not None:
+                    try:
+                        physical_turn.cancel_queued()
+                    except Exception:
+                        pass
                 server._tool_slots.release()
                 done.set()
 

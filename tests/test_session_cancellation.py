@@ -15,6 +15,8 @@ from test_http_protocols import HTTPFixture, sse_message
 
 class SessionCancellationTests(HTTPFixture, unittest.TestCase):
     def setUp(self):
+        from _physical_test_support import authorize_offline_dispatch
+        authorize_offline_dispatch(self)
         self.executed = []
         self.workers = []
         dispatch._halt.clear()

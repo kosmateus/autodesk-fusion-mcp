@@ -8,6 +8,7 @@ from ..lib.admission_http import AdmissionHTTP
 from ..lib.admission_json import decode_json
 from ..lib.admission_receiver import AdmissionReceiver
 from ..lib.request_admission import AdmissionError, AdmissionStore, GenerationUnchangedError
+from ..lib.physical_authority import PhysicalAuthority
 from .admission_document import select_operation
 
 
@@ -37,7 +38,8 @@ def process_birth():
 def _lease(database):
     # The provisioner supplies a private local directory and canonical path.
     # Never unlink the sidecar: contenders must lock the very same file.
-    fd = os.open(str(database) + ".lease", os.O_CREAT | os.O_RDWR, 0o600)
+    fd = os.open(str(database) + ".lease",
+                 os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
         if sys.platform == "win32":
             import msvcrt
@@ -52,7 +54,8 @@ def _lease(database):
 
 
 class AdmissionRuntime:
-    def __init__(self, provision, dispatch, *, shutdown=None):
+    def __init__(self, provision, dispatch, *, shutdown=None,
+                 version="unknown", endpoint="http://127.0.0.1:8765/mcp"):
         fields = {"database", "pid", "birth", "instance", "epoch", "source",
                   "build", "credentials"}
         if (not isinstance(provision, dict) or set(provision) != fields
@@ -70,10 +73,14 @@ class AdmissionRuntime:
         database = database.resolve()
         self._lease = _lease(database)
         self._store = None
+        self.physical = None
         self._transition_uncertain = False
+        self._transition_committed = False
         try:
             self._store = AdmissionStore(database, instance=provision["instance"],
                                          epoch=provision["epoch"], create=False)
+            self.physical = PhysicalAuthority(provision, self._store, _lease,
+                                               version=version, endpoint=endpoint)
             receiver = AdmissionReceiver(
                 self._store, source=provision["source"], build=provision["build"],
                 select_operation=select_operation,
@@ -85,7 +92,7 @@ class AdmissionRuntime:
             raise
 
     @classmethod
-    def from_environment(cls, dispatch, *, shutdown=None):
+    def from_environment(cls, dispatch, *, shutdown=None, **kwargs):
         path = os.environ.get("FUSION_MCP_ADMISSION_PROVISION")
         if path is None:
             return None
@@ -93,13 +100,21 @@ class AdmissionRuntime:
         if not provision_path.is_absolute():
             raise AdmissionError("Admission provision must use an absolute local path")
         return cls(decode_json(provision_path.read_text(encoding="utf-8")), dispatch,
-                   shutdown=shutdown)
+                   shutdown=shutdown, **kwargs)
 
-    def advance_generation(self, *, instance, epoch):
+    def advance_generation(self, *, instance, epoch, handoff_id=None):
+        if not isinstance(handoff_id, str) or not handoff_id:
+            raise GenerationUnchangedError("A nonempty handoff ID is required")
         if self._transition_uncertain:
             raise AdmissionError("Prior generation transition outcome is unknown")
+        if self._transition_committed:
+            raise AdmissionError("Prior handoff already committed; query the same handoff ID")
         try:
-            self._store.advance_generation(instance=instance, epoch=epoch)
+            result = self._store.advance_generation(
+                instance=instance, epoch=epoch, handoff_id=handoff_id,
+            )
+            self._transition_committed = True
+            return result
         except GenerationUnchangedError:
             raise
         except BaseException:
@@ -107,6 +122,11 @@ class AdmissionRuntime:
             raise
 
     def close(self):
+        if self.physical is not None:
+            self.physical.close()
+            self.physical = None
         if self._store is not None:
             self._store.close()
-        os.close(self._lease)
+        if self._lease is not None:
+            os.close(self._lease)
+            self._lease = None
