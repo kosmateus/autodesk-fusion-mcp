@@ -102,6 +102,11 @@ Errors/parse failures are refused (exit 1), never interpreted as absent.
 In particular, a head pointer without its record table/row is corruption, not
 absence. A missing request is absent only with a consistent empty active head;
 an unrelated active operation does not authorize an automatic begin.
+All generation/runtime/handoff/head/record reads share one short deferred
+SQLite read transaction: QUERY reserves no writer and cannot combine different
+committed snapshots. Idempotent BEGIN and CONSUME check that same complete
+state inside their existing write transaction before returning a stored result;
+a missing/corrupt pointer is neither repaired nor bypassed by a cached receipt.
 Query/resume uses today's operator capability, without the old session token.
 Resume begin/consume audit actor is separate; it does not alter the frozen
 initiator or operation identity.

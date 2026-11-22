@@ -442,11 +442,11 @@ class AdmissionStore:
         return _encode(binding)
 
     @contextmanager
-    def _transaction(self):
+    def _transaction(self, *, read_snapshot=False):
         with self._lock:
             if self._db is None:
                 raise AdmissionError("Store closed")
-            self._db.execute("BEGIN IMMEDIATE")
+            self._db.execute("BEGIN DEFERRED" if read_snapshot else "BEGIN IMMEDIATE")
             try:
                 yield
                 self._db.execute("COMMIT")

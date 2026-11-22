@@ -233,6 +233,74 @@ os._exit(71)
         with self.assertRaises((AdmissionError, sqlite3.DatabaseError)):
             rebaseline_fence.query_fence(operator, dict(requestId="operation-1"))
 
+    def test_review_consistency_idempotent_begin_and_consume_refuse_deleted_pointer(self):
+        pending = self.begin()
+        operator, _ = self.operator()
+        proof = self.publication(pending["binding"])
+        consumed = rebaseline_fence.consume_fence(operator, proof)
+        self.store._db.execute("DELETE FROM provision_fence_head")
+        for action in (
+            lambda: rebaseline_fence.query_fence(operator, dict(requestId="operation-1")),
+            lambda: rebaseline_fence.begin_fence(operator, self.request),
+            lambda: rebaseline_fence.consume_fence(operator, proof),
+        ):
+            with self.assertRaises(AdmissionError):
+                action()
+        self.assertEqual(self.store._db.execute("SELECT COUNT(*) FROM provision_fence_head").fetchone(), (0,))
+        self.assertEqual(self.store._db.execute(
+            "SELECT receipt_json FROM provision_fences WHERE request_id='operation-1'",
+        ).fetchone()[0], consumed["receiptJson"])
+        # Fixture repair only proves refusals did not erase/replace the receipt;
+        # no production path repairs or fabricates a pointer.
+        self.store._db.execute("INSERT INTO provision_fence_head VALUES (1,'operation-1')")
+        self.assertEqual(rebaseline_fence.begin_fence(operator, self.request), consumed)
+        self.assertEqual(rebaseline_fence.consume_fence(operator, proof), consumed)
+
+    def test_review_consistency_query_uses_one_snapshot_while_other_connection_changes_generation_and_pointer(self):
+        self.store._db.execute("PRAGMA journal_mode=WAL")
+        pending = self.begin()
+        operator, _ = self.operator()
+        from lib import rebaseline_fence_store
+        original_verify = rebaseline_fence_store._verify_runtime
+        checked, committed = threading.Event(), threading.Event()
+        errors = []
+
+        def concurrent_change():
+            try:
+                self.assertTrue(checked.wait(3))
+                with closing(sqlite3.connect(self.database, isolation_level=None, timeout=2)) as writer:
+                    writer.execute("BEGIN IMMEDIATE")
+                    writer.execute("UPDATE generation SET epoch='concurrent-successor'")
+                    writer.execute("DELETE FROM provision_fence_head")
+                    writer.execute("COMMIT")
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                committed.set()
+
+        def verified_then_race(store, authority):
+            original_verify(store, authority)
+            checked.set()
+            self.assertTrue(committed.wait(4), "Read snapshot must not reserve the writer")
+            self.assertEqual(errors, [])
+
+        thread = threading.Thread(target=concurrent_change)
+        thread.start()
+        try:
+            with patch.object(rebaseline_fence_store, "_verify_runtime", side_effect=verified_then_race):
+                self.assertEqual(rebaseline_fence.query_fence(
+                    operator, dict(requestId="operation-1"),
+                ), pending)  # Entirely BEFORE, never old generation plus new pointer.
+        finally:
+            checked.set()
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(self.store._db.execute("SELECT epoch FROM generation").fetchone(),
+                         ("concurrent-successor",))
+        with self.assertRaises(AdmissionError):
+            rebaseline_fence.query_fence(operator, dict(requestId="operation-1"))
+
     def test_regression_consumed_grant_allows_legitimate_handoff_not_a_global_deadend(self):
         pending = self.begin()
         operator, _ = self.operator("operator-B")
@@ -806,7 +874,7 @@ print("PENDING_COMMITTED",flush=True)
         operator, _ = self.operator()
         self.assertEqual(rebaseline_fence.query_fence(operator, dict(requestId="operation-1"))["state"], "absent")
 
-    def test_query_of_pending_has_only_selects_and_no_audit_mutation(self):
+    def test_query_of_pending_has_one_read_snapshot_and_no_audit_mutation(self):
         self.begin()
         operator, _ = self.operator("reader")
         statements = []
@@ -817,7 +885,10 @@ print("PENDING_COMMITTED",flush=True)
         finally:
             self.store._db.set_trace_callback(None)
         self.assertTrue(statements)
-        self.assertTrue(all(sql.lstrip().upper().startswith("SELECT") for sql in statements), statements)
+        self.assertEqual(statements[0], "BEGIN DEFERRED")
+        self.assertEqual(statements[-1], "COMMIT")
+        self.assertTrue(all(sql.lstrip().upper().startswith("SELECT")
+                            for sql in statements[1:-1]), statements)
 
     @unittest.skipUnless(os.name == "posix", "Actual Linux/POSIX writer publication boundary")
     def test_posix_cas_child_death_gap_resumes_exact_new_under_lock_before_native_consume(self):

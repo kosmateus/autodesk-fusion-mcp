@@ -243,6 +243,7 @@ def _response(row, authority):
 def begin(store, facts, authority):
     with store._transaction():
         _verify_runtime(store, authority)
+        active_head(store)  # Idempotent results must not bypass corrupted state.
         _schema(store)
         previous = _row(store, facts["requestId"], authority)
         if previous is not None:
@@ -276,7 +277,7 @@ def begin(store, facts, authority):
 
 
 def query(store, request_id, authority):
-    with store._lock:
+    with store._transaction(read_snapshot=True):
         _verify_runtime(store, authority)
         current = active_head(store)  # Prove pointer/table consistency BEFORE absent.
         if not _table(store, "provision_fences"):
@@ -292,6 +293,7 @@ def query(store, request_id, authority):
 def consume(store, request, authority):
     with store._transaction():
         _verify_runtime(store, authority)
+        active_head(store)  # Also gate repeated consumed receipts and historical reads.
         if not _table(store, "provision_fences"):
             raise AdmissionError("No durable rebaseline intent exists")
         row = _row(store, request["requestId"], authority)
