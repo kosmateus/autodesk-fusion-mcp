@@ -9,7 +9,10 @@ import test_admission_receiver
 
 
 class AdmissionDispatchContracts(unittest.TestCase):
-    setUp = test_admission_receiver.ReceiverContracts.setUp
+    def setUp(self):
+        test_admission_receiver.ReceiverContracts.setUp(self)
+        from _physical_test_support import authorize_offline_dispatch
+        authorize_offline_dispatch(self)
 
     def test_queued_withdrawal_prevents_effect_at_consumption(self):
         _, consumer = self.receiver.prepare("owner", self.binding, self.payload)

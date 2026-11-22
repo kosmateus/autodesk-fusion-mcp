@@ -101,9 +101,11 @@ class MCPServer:
         max_tool_requests: int = 16,
         tool_timeout: float = 120.0,
         admission_api=None,
+        physical_authority=None,
     ):
         self.port = port
         self.admission_api = admission_api
+        self.physical_authority = physical_authority
         # Keep legacy single-tool attributes for backwards compat
         self.tool_handler = tool_handler
         self.tool_name = tool_name
@@ -270,7 +272,19 @@ class MCPServer:
                 if not self._validate_origin():
                     return
                 parsed = urlparse(self.path)
-                if parsed.path == "/mcp":
+                self._physical_capability = None
+                if parsed.path in ("/mcp", "/admission/v1", "/physical/v1/turn-status") and server_ref.physical_authority is not None:
+                    from .physical_authority import HEADER
+                    try:
+                        self._physical_capability = server_ref.physical_authority.authenticate(
+                            self.headers.get_all(HEADER, []),
+                        )
+                    except PermissionError:
+                        self._send_empty(401, close=True)
+                        return
+                if parsed.path == "/physical/v1/turn-status" and server_ref.physical_authority is not None:
+                    self._handle_physical_turn_status()
+                elif parsed.path == "/mcp":
                     self._handle_mcp_post()
                 elif parsed.path == "/admission/v1" and server_ref.admission_api is not None:
                     self._handle_admission_post()
@@ -278,6 +292,36 @@ class MCPServer:
                     # The body was not consumed, so do not interpret it as
                     # the next request on a keep-alive connection.
                     self._send_empty(404, close=True)
+
+            def _handle_physical_turn_status(self):
+                from .admission_json import decode_json
+                from .request_admission import AdmissionError
+                lengths = self.headers.get_all("Content-Length", [])
+                if (self.headers.get_all("Transfer-Encoding", [])
+                        or len(lengths) != 1 or not lengths[0].isascii()
+                        or not lengths[0].isdigit() or len(lengths[0]) > 6
+                        or not 0 < int(lengths[0]) <= 65536):
+                    self._send_empty(400, close=True)
+                    return
+                old_timeout = self.connection.gettimeout()
+                self.connection.settimeout(10)
+                try:
+                    body = self.rfile.read(int(lengths[0]))
+                    if len(body) != int(lengths[0]):
+                        self._send_empty(400, close=True)
+                        return
+                    binding = decode_json(body.decode("utf-8"))
+                    self._physical_capability.validate()
+                    result = server_ref.physical_authority.turn_status(binding)
+                except (AdmissionError, ValueError, UnicodeError):
+                    self._send_empty(400, close=True)
+                    return
+                except (OSError, PermissionError):
+                    self._send_empty(401, close=True)
+                    return
+                finally:
+                    self.connection.settimeout(old_timeout)
+                self._send_json_response(200, result)
 
             def _handle_admission_post(self):
                 from .request_admission import AdmissionError
@@ -329,7 +373,22 @@ class MCPServer:
                     self.connection.settimeout(old_timeout)
                 try:
                     message = decode_json(body.decode("utf-8"))
-                    result = server_ref.admission_api.handle(principal, message)
+                    if server_ref.physical_authority is None:
+                        result = server_ref.admission_api.handle(principal, message)
+                    else:
+                        physical_turn_factory = None
+                        if isinstance(message, dict) and message.get("operation") == "admit":
+                            turn_id, target = server_ref.physical_authority.turn_headers(self.headers)
+                            binding = message.get("binding")
+                            if (not isinstance(binding, dict) or turn_id != binding.get("request")
+                                    or target != binding.get("document")):
+                                raise AdmissionError("Physical turn and admission binding disagree")
+                            capability = self._physical_capability
+                            physical_turn_factory = lambda: capability.prepare_turn(turn_id, target)
+                        result = server_ref.admission_api.handle(
+                            principal, message, physical_capability=self._physical_capability,
+                            physical_turn_factory=physical_turn_factory,
+                        )
                 except AdmissionCapacityError:
                     self._send_empty(503, close=True)
                     return
@@ -782,6 +841,11 @@ class MCPServer:
 
                 # Convert to the format the existing handler expects
                 call_data = {"params": {"name": tool_name, "arguments": arguments}}
+                call_data["_physical_capability"] = getattr(self, "_physical_capability", None)
+                if server_ref.physical_authority is not None:
+                    call_data["_physical_turn"] = server_ref.physical_authority.turn_from_headers(
+                        call_data["_physical_capability"], self.headers,
+                    )
                 request_key = server_ref._request_key(request_id, session_id)
                 if request_key is not None:
                     call_data["_request_key"] = request_key

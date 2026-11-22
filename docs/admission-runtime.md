@@ -1,8 +1,9 @@
 # Opt-in keyed admission
 
 When `FUSION_MCP_ADMISSION_PROVISION` is unset, the add-in does not expose
-`/admission/v1` and does not open an admission database. The existing `/mcp`
-tools are unchanged. Do not provision keyed admission on an active runtime.
+`/admission/v1` and does not open an admission database. SDK-producing `/mcp`
+calls now fail closed without the private physical grant described in
+[the physical ownership contract](physical-grant.md). Do not provision keyed admission on an active runtime.
 As with the legacy listener, admission does not bind a socket on cold start
 until Fusion has serviced a real main-thread readiness event.
 
@@ -51,9 +52,10 @@ code already trusted to run arbitrary Python in the Fusion process.
 
 ## Generation handoff
 
-The local trusted lifecycle caller can invoke
-`fusion_bridge.runtime.handoff_admission_generation(instance=…, epoch=…)`
-on the Fusion main thread. This is not an HTTP method. It cuts off intake
+The local trusted operator uses `python3 -m lib.physical_lifecycle handoff`
+with the exact private request documented in [the ownership contract](physical-grant.md).
+Its mailbox invokes `fusion_bridge.runtime.handoff_admission_generation`
+on the Fusion main thread, with a durable handoff ID. This is not an MCP or SDK method. It cuts off intake
 on both dispatch paths and abandons only queued, not-yet-started envelopes.
 If a handler remains on the stack, the SDK is still processing a call to
 fire a Custom Event, or an admission API call remains active, handoff

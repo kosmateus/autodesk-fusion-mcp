@@ -76,7 +76,9 @@ class AdmissionHTTP:
             raise PermissionError("Admission authentication required")
         return principal
 
-    def handle(self, principal, message):
+    def handle(self, principal, message, *, physical_capability=None, physical_turn_factory=None):
+        if physical_capability is not None:
+            physical_capability.validate()
         with self._lifecycle:
             if self._sealed or (
                 isinstance(message, dict) and message.get("operation") == "admit"
@@ -86,12 +88,13 @@ class AdmissionHTTP:
                 raise AdmissionCapacityError("Admission runtime is quiescing")
             self._requests += 1
         try:
-            return self._handle(principal, message)
+            return self._handle(principal, message, physical_capability=physical_capability,
+                                physical_turn_factory=physical_turn_factory)
         finally:
             with self._lifecycle:
                 self._requests -= 1
 
-    def _handle(self, principal, message):
+    def _handle(self, principal, message, *, physical_capability=None, physical_turn_factory=None):
         if (not isinstance(message, dict)
                 or type(message.get("version")) is not int or message["version"] != 1):
             raise AdmissionError("Unsupported admission protocol")
@@ -112,6 +115,7 @@ class AdmissionHTTP:
                 record, consumer = self._receiver.prepare_encoded(principal, binding, encoded)
                 if consumer is None:
                     return record
+                physical_turn = physical_turn_factory() if physical_turn_factory is not None else None
                 cancelled = threading.Event()
                 timer = threading.Timer(self._timeout, cancelled.set)
                 timer.daemon = True
@@ -119,7 +123,9 @@ class AdmissionHTTP:
                 # Local lifecycle metadata is not part of the admitted payload.
                 # The consumer passes its frozen original to the SDK handler.
                 try:
-                    self._dispatch({"_cancel_event": cancelled},
+                    self._dispatch({"_cancel_event": cancelled,
+                                    "_physical_capability": physical_capability,
+                                    "_physical_turn": physical_turn},
                                    admission_consumer=consumer)
                 except AdmissionTargetError:
                     raise

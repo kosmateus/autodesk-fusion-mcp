@@ -13,6 +13,8 @@ from fusion_bridge import dispatch
 
 class AdmissionHTTPContracts(HTTPFixture, unittest.TestCase):
     def setUp(self):
+        from _physical_test_support import authorize_offline_dispatch
+        authorize_offline_dispatch(self)
         test_admission_receiver.ReceiverContracts.setUp(self)
         self.effects = []
         self.sends = []

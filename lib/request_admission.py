@@ -6,6 +6,7 @@ terminal evidence is UNKNOWN and can never grant a second execution.
 
 from contextlib import contextmanager
 import json
+import hashlib
 from pathlib import Path
 import sqlite3
 import threading
@@ -93,7 +94,7 @@ class AdmissionStore:
                 self._db = None
                 self._claims.clear()
 
-    def advance_generation(self, *, instance, epoch):
+    def advance_generation(self, *, instance, epoch, handoff_id=None):
         """Explicit CAS transition by the current runtime after a safe handoff.
 
         This does not stop active SDK work; bootstrap must quiesce it first.
@@ -101,7 +102,26 @@ class AdmissionStore:
         """
         if not all(isinstance(v, str) and v for v in (instance, epoch)):
             raise GenerationUnchangedError("Server instance and epoch are required")
+        if handoff_id is not None and (not isinstance(handoff_id, str) or not handoff_id):
+            raise GenerationUnchangedError("A nonempty handoff ID is required")
         with self._transaction():
+            self._db.execute("""
+                CREATE TABLE IF NOT EXISTS physical_handoffs (
+                    id TEXT PRIMARY KEY, result TEXT NOT NULL
+                )
+            """)
+            result = dict(handoffId=handoff_id,
+                          generation=dict(instance=self._instance, epoch=self._epoch),
+                          nextGeneration=dict(instance=instance, epoch=epoch),
+                          state="completed")
+            if handoff_id is not None:
+                previous = self._db.execute(
+                    "SELECT result FROM physical_handoffs WHERE id=?", (handoff_id,),
+                ).fetchone()
+                if previous is not None:
+                    if previous[0] != _encode(result):
+                        raise GenerationUnchangedError("Handoff ID binding conflict")
+                    return json.loads(previous[0])
             current = self._db.execute(
                 "SELECT instance,epoch FROM generation WHERE singleton=1"
             ).fetchone()
@@ -121,6 +141,115 @@ class AdmissionStore:
             ).rowcount
             if changed != 1:
                 raise AdmissionError("Generation transition lost its fence")
+            if handoff_id is not None:
+                self._db.execute("INSERT INTO physical_handoffs VALUES (?,?)",
+                                 (handoff_id, _encode(result)))
+            return result
+
+    def assert_current_generation(self):
+        with self._lock:
+            if self._db is None or self._db.execute(
+                "SELECT instance,epoch FROM generation WHERE singleton=1",
+            ).fetchone() != (self._instance, self._epoch):
+                raise AdmissionError("Physical generation is no longer current")
+
+    def bind_physical_owner(self, descriptor):
+        """Persist the owner binding in this same store, never another queue DB."""
+        generation = _encode(descriptor["generation"])
+        binding = _encode(descriptor)
+        with self._transaction():
+            self.assert_current_generation()
+            if self._db.execute("SELECT COUNT(*) FROM generation_history").fetchone()[0] > 1:
+                self._db.execute("""
+                    CREATE TABLE IF NOT EXISTS physical_handoffs (
+                        id TEXT PRIMARY KEY, result TEXT NOT NULL
+                    )
+                """)
+                receipt = self._db.execute(
+                    "SELECT result FROM physical_handoffs WHERE id=?",
+                    (descriptor["handoffId"],),
+                ).fetchone()
+                if receipt is None or json.loads(receipt[0])["nextGeneration"] != descriptor["generation"]:
+                    raise AdmissionError("Physical grant requires its durable generation handoff")
+            self._db.execute("""
+                CREATE TABLE IF NOT EXISTS physical_owners (
+                    generation TEXT PRIMARY KEY, binding TEXT NOT NULL
+                )
+            """)
+            row = self._db.execute(
+                "SELECT binding FROM physical_owners WHERE generation=?", (generation,),
+            ).fetchone()
+            if row is not None and row[0] != binding:
+                raise AdmissionError("Physical generation already belongs to another owner")
+            self._db.execute("INSERT OR IGNORE INTO physical_owners VALUES (?,?)",
+                             (generation, binding))
+
+    def _turn_schema(self):
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS physical_turns (
+                id TEXT PRIMARY KEY, binding TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('queued','active','released')),
+                released_by TEXT
+            )
+        """)
+
+    def prepare_physical_turn(self, binding):
+        with self._transaction():
+            self.assert_current_generation()
+            self._turn_schema()
+            if self._db.execute(
+                "SELECT 1 FROM physical_turns WHERE id=?", (binding["turnId"],),
+            ).fetchone() is not None:
+                raise AdmissionError("Physical turn ID cannot be replayed")
+            self._db.execute(
+                "INSERT INTO physical_turns VALUES (?,?,'queued',NULL)",
+                (binding["turnId"], _encode(binding)),
+            )
+
+    def start_physical_turn(self, binding):
+        with self._transaction():
+            self.assert_current_generation()
+            changed = self._db.execute(
+                "UPDATE physical_turns SET state='active' "
+                "WHERE id=? AND binding=? AND state='queued'",
+                (binding["turnId"], _encode(binding)),
+            ).rowcount
+            if changed != 1:
+                raise AdmissionError("Physical turn is already consumed or sealed")
+
+    def release_physical_turn(self, binding, *, queued_only=False):
+        with self._transaction():
+            # A generation handoff cannot overtake an active main-thread turn.
+            # Do not infer release just because a different generation exists.
+            self.assert_current_generation()
+            self._db.execute(
+                "UPDATE physical_turns SET state='released',released_by=? "
+                "WHERE id=? AND binding=? AND state=?",
+                ("cancelled-before-sdk" if queued_only else "dispatch-finally",
+                 binding["turnId"], _encode(binding), "queued" if queued_only else "active"),
+            )
+
+    def physical_turn_status(self, binding):
+        with self._lock:
+            self.assert_current_generation()
+            result = dict(state="unknown", binding=binding)
+            if self._db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='physical_turns'",
+            ).fetchone() is None:
+                return result
+            row = self._db.execute(
+                "SELECT binding,state,released_by FROM physical_turns WHERE id=?",
+                (binding["turnId"],),
+            ).fetchone()
+            if row is None or row[0] != _encode(binding):
+                return result
+            result["state"] = "released" if row[1] == "released" else "active"
+            if row[1] == "released":
+                evidence = dict(binding=binding, state="released", releasedBy=row[2])
+                digest = hashlib.sha256(_encode(evidence).encode("utf-8")).hexdigest()
+                result.update(physicalEvidenceReference="fmcad-physical-turn:sha256:" + digest,
+                              evidenceDigest=digest)
+            return result
 
     def _binding(self, binding):
         if not isinstance(binding, dict) or set(binding) != self._FIELDS:

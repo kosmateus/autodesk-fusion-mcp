@@ -100,6 +100,8 @@ class _MainThreadPump:
 
 class ServerLifecycleTests(unittest.TestCase):
     def setUp(self):
+        from _physical_test_support import authorize_offline_dispatch
+        authorize_offline_dispatch(self)
         self._original = {
             "port": settings.MCP_SERVER_PORT,
             "auto_connect": settings.MCP_AUTO_CONNECT,
