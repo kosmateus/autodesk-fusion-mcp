@@ -47,6 +47,8 @@ if scenario == "boolean-engine": intent["engineVersion"] = True
 if scenario == "extra-field": intent["fresh"] = True
 if scenario == "traversal": intent["installed"]["files"]["../outside.py"] = "0" * 64
 if scenario == "same-output": intent["receipts"]["returned"] = "entry.json"
+if scenario == "case-alias-output": intent["receipts"]["returned"] = "ENTRY.json"
+if scenario == "reserved-output": intent["receipts"]["entry"] = "con.json"
 if scenario == "output-traversal": intent["receipts"]["entry"] = "../entry.json"
 if scenario == "output-in-source": intent["receipts"]["directory"] = str(package)
 raw = json.dumps(intent).encode()
@@ -186,6 +188,7 @@ class BootstrapEntryTests(unittest.TestCase):
             "malformed", "duplicate-key", "invalid-utf8", "wrong-birth", "wrong-pid",
             "wrong-hash", "wrong-profile", "wrong-path", "wrong-source", "wrong-purpose",
             "boolean-version", "boolean-engine", "extra-field", "traversal", "same-output",
+            "case-alias-output", "reserved-output",
             "output-traversal", "output-in-source", "public-intent", "public-directory",
             "public-source", "extra-source", "mutated-source", "symlink-source",
             "symlink-intent", "empty-env",

@@ -118,7 +118,8 @@ class BootstrapEntry:
         if names[0] == names[1]:
             _deny()
         for name in names:
-            if (type(name) is not str or re.fullmatch("[a-zA-Z0-9_-]+[.]json", name) is None):
+            if (type(name) is not str or re.fullmatch("[a-z0-9_-]+[.]json", name) is None
+                    or re.fullmatch("(con|prn|aux|nul|com[1-9]|lpt[1-9])[.]json", name)):
                 _deny()
         self.entry_path, self.returned_path = (self.output / name for name in names)
         # Output must not alter the full installed manifest or any original input.

@@ -55,8 +55,10 @@ Configure `PYTHONDONTWRITEBYTECODE=1` at process launch to avoid import-created
 files invalidating the full manifest. Existing caches must themselves be pinned
 or removed by the authorized operator before the manifest is produced.
 
-The two receipt names must differ and contain only ASCII letters, digits,
-underscores, hyphens and the `.json` suffix. Outputs cannot be inside the
+The two receipt names must differ and contain only lowercase ASCII letters,
+digits, underscores, hyphens and the `.json` suffix. DOS device basenames
+(`con`, `prn`, `aux`, `nul`, `com1`–`com9`, `lpt1`–`lpt9`) are forbidden.
+This also excludes case-only aliases on Windows. Outputs cannot be inside the
 installed tree or alias the intent/profile. The operator allocates a fresh nonce
 and paths per attempt; previously created receipts cannot be resumed or replaced.
 
