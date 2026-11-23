@@ -49,6 +49,10 @@ if scenario == "traversal": intent["installed"]["files"]["../outside.py"] = "0" 
 if scenario == "same-output": intent["receipts"]["returned"] = "entry.json"
 if scenario == "case-alias-output": intent["receipts"]["returned"] = "ENTRY.json"
 if scenario == "reserved-output": intent["receipts"]["entry"] = "con.json"
+if scenario == "reserved-com-output": intent["receipts"]["entry"] = "com1.json"
+if scenario == "reserved-lpt-output": intent["receipts"]["entry"] = "lpt9.json"
+if scenario == "trailing-dot-output": intent["receipts"]["entry"] = "entry.json."
+if scenario == "trailing-space-output": intent["receipts"]["entry"] = "entry.json "
 if scenario == "output-traversal": intent["receipts"]["entry"] = "../entry.json"
 if scenario == "output-in-source": intent["receipts"]["directory"] = str(package)
 raw = json.dumps(intent).encode()
@@ -189,6 +193,8 @@ class BootstrapEntryTests(unittest.TestCase):
             "wrong-hash", "wrong-profile", "wrong-path", "wrong-source", "wrong-purpose",
             "boolean-version", "boolean-engine", "extra-field", "traversal", "same-output",
             "case-alias-output", "reserved-output",
+            "reserved-com-output", "reserved-lpt-output", "trailing-dot-output",
+            "trailing-space-output",
             "output-traversal", "output-in-source", "public-intent", "public-directory",
             "public-source", "extra-source", "mutated-source", "symlink-source",
             "symlink-intent", "empty-env",
