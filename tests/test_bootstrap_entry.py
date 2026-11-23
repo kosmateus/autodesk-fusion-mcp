@@ -11,7 +11,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = r'''
-import hashlib, importlib.util, json, os, pathlib, sys, types
+import hashlib, importlib.util, json, os, pathlib, subprocess, sys, types
 root = pathlib.Path(sys.argv[1])
 scenario = sys.argv[2]
 package = root / "installed"
@@ -61,18 +61,42 @@ if scenario == "duplicate-key": raw = raw[:-1] + b', "version":1}'
 if scenario == "invalid-utf8": raw = raw[:-1] + b'\xff}'
 intent_file.write_bytes(raw)
 intent_file.chmod(0o600)
-if scenario == "public-intent": intent_file.chmod(0o644)
-if scenario == "public-directory": private.chmod(0o755)
-if scenario == "public-source": (package / "addon_runtime.py").chmod(0o644)
+def make_public(path, mode):
+    if os.name == "nt":
+        subprocess.run([str(pathlib.Path(os.environ["SystemRoot"]) / "System32" / "icacls.exe"),
+                        str(path), "/grant", "*S-1-1-0:R"], check=True, capture_output=True)
+    else:
+        path.chmod(mode)
+if scenario == "public-intent": make_public(intent_file, 0o644)
+if scenario == "public-directory": make_public(private, 0o755)
+if scenario == "public-source": make_public(package / "addon_runtime.py", 0o644)
 if scenario == "extra-source":
     (package / "unexpected.py").write_text("pass")
     (package / "unexpected.py").chmod(0o600)
 if scenario == "mutated-source":
     with (package / "addon_runtime.py").open("a") as f: f.write("\n# changed")
 if scenario == "symlink-source":
-    (package / "alias.py").symlink_to(package / "addon_runtime.py")
+    try:
+        (package / "alias.py").symlink_to(package / "addon_runtime.py")
+    except OSError as exc:
+        if os.name == "nt" and exc.winerror == 1314:
+            print("FIXTURE_NOTRUN=WINDOWS_SYMLINK_PRIVILEGE_UNAVAILABLE"); sys.exit(77)
+        raise
 if scenario == "symlink-intent":
-    alias = private / "alias.json"; alias.symlink_to(intent_file); intent_file = alias
+    alias = private / "alias.json"
+    try:
+        alias.symlink_to(intent_file)
+    except OSError as exc:
+        if os.name == "nt" and exc.winerror == 1314:
+            print("FIXTURE_NOTRUN=WINDOWS_SYMLINK_PRIVILEGE_UNAVAILABLE"); sys.exit(77)
+        raise
+    intent_file = alias
+if scenario == "hardlink-intent":
+    alias = private / "hardlink.json"; os.link(intent_file, alias); intent_file = alias
+if scenario == "junction-source":
+    subprocess.run([str(pathlib.Path(os.environ["SystemRoot"]) / "System32" / "cmd.exe"),
+                    "/d", "/c", "mklink", "/J", str(package / "junction"), str(package / "lib")],
+                   check=True, capture_output=True)
 if scenario == "preexisting-entry":
     (private / "entry.json").write_bytes(b"ORIGINAL"); (private / "entry.json").chmod(0o600)
 if scenario == "preexisting-return":
@@ -88,6 +112,11 @@ spec = importlib.util.spec_from_file_location("fixture_addin.AutodeskFusionMCP",
 entry = importlib.util.module_from_spec(spec); spec.loader.exec_module(entry)
 entry.run({"fixture": True})
 if scenario == "replay": entry.run({"fixture": True})
+if scenario == "valid" and os.name == "nt":
+    from lib.physical_authority import _check_windows_acl
+    _check_windows_acl(private / "entry.json")
+    _check_windows_acl(private / "returned.json")
+    print("RECEIPT_ACL_PRIVATE=True")
 print("SDK_MODULES=" + json.dumps([m for m in sys.modules if m == "adsk" or m.startswith("adsk.")]))
 '''
 
@@ -152,6 +181,8 @@ class BootstrapEntryTests(unittest.TestCase):
             [sys.executable, "-I", "-B", "-c", RUNNER, str(root), scenario],
             env=env, text=True, capture_output=True, timeout=15,
         )
+        if result.returncode == 77 and "FIXTURE_NOTRUN=WINDOWS_SYMLINK_PRIVILEGE_UNAVAILABLE" in result.stdout:
+            self.skipTest("Actual Windows symlink fixture NOTRUN: token lacks SeCreateSymbolicLinkPrivilege")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("SDK_MODULES=[]", result.stdout)
         return private, result
@@ -184,11 +215,14 @@ class BootstrapEntryTests(unittest.TestCase):
             "path": str(private / "entry.json"), "sha256": hashlib.sha256(entry_bytes).hexdigest()})
         self.assertNotIn("ready", returned)
         self.assertNotIn("clean", returned)
-        self.assertEqual((private / "entry.json").stat().st_mode & 0o777, 0o600)
+        if os.name == "nt":
+            self.assertIn("RECEIPT_ACL_PRIVATE=True", result.stdout)
+        else:
+            self.assertEqual((private / "entry.json").stat().st_mode & 0o777, 0o600)
         self.assertNotIn("Failed to start", result.stdout)
 
     def test_invalid_intents_never_import_addon_runtime(self):
-        for scenario in (
+        scenarios = (
             "malformed", "duplicate-key", "invalid-utf8", "wrong-birth", "wrong-pid",
             "wrong-hash", "wrong-profile", "wrong-path", "wrong-source", "wrong-purpose",
             "boolean-version", "boolean-engine", "extra-field", "traversal", "same-output",
@@ -198,7 +232,10 @@ class BootstrapEntryTests(unittest.TestCase):
             "output-traversal", "output-in-source", "public-intent", "public-directory",
             "public-source", "extra-source", "mutated-source", "symlink-source",
             "symlink-intent", "empty-env",
-        ):
+        )
+        if os.name == "nt":
+            scenarios += ("hardlink-intent", "junction-source")
+        for scenario in scenarios:
             with self.subTest(scenario=scenario):
                 private, result = self.run_fixture(scenario)
                 self.assertFalse((private / "events").exists())

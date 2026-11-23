@@ -91,6 +91,13 @@ python3 -I -B -m unittest discover -s tests -p test_bootstrap_entry.py -v
 ```
 
 Tests execute the actual entrypoint and copied helper files in benign subprocess
-packages with a fake `addon_runtime`, real Linux OS birth observations, private
-temporary files and no Fusion SDK modules. They do not qualify Windows ACLs,
-the deployed add-in, the operator's controlled profile, or a real Fusion host.
+packages with a fake `addon_runtime`, real OS process-birth observations, private
+temporary files and no Fusion SDK modules. Run the same suite with the pinned
+native Windows Python to exercise its real OS birth and private ACL checks.
+Windows public-input fixtures add an actual Everyone read ACE instead of using
+POSIX `chmod`; successful receipts are checked with the existing private DACL
+helper. Junction and hard-link fixtures also exercise Windows alias rejection.
+Symbolic-link fixtures report NOTRUN if the token lacks the required Windows
+privilege; tests do not request elevation or count that refusal as a PASS.
+Neither platform's fixtures qualify the deployed add-in, the operator's
+controlled profile, or a real Fusion host.
