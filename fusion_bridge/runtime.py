@@ -161,7 +161,7 @@ def _listen(server, admission, shutdown_flag, attempt):
     return True
 
 
-def _server_start_worker(shutdown_flag=None):
+def _server_start_worker(shutdown_flag=None, bootstrap=None):
     """Bind the MCP port only once Fusion's main thread is pumping events.
 
     During a cold start Fusion auto-loads add-ins before its event loop is
@@ -188,6 +188,8 @@ def _server_start_worker(shutdown_flag=None):
         if shutdown_flag.is_set():
             return
         try:
+            if bootstrap is not None:
+                bootstrap.assert_ready_for_listener()
             if not _start_server(shutdown_flag):
                 request_main_thread_shutdown(shutdown_flag)
         except Exception as exc:
@@ -199,17 +201,25 @@ def _server_start_worker(shutdown_flag=None):
             request_main_thread_shutdown(shutdown_flag)
 
 
-def start():
+def start(*, bootstrap=None):
     global _sdk_version
     _require_main_thread()
     version_info = python_exec.get_version_info(python_exec.get_addin_dir())
     log(f"MCP Integration starting... add-in {version_info}")
-    fusion_version = getattr(adsk.core.Application.get(), "version", "unknown")
+    if bootstrap is not None:
+        from ..lib.bootstrap_entry import BootstrapEntry
+        if type(bootstrap) is not BootstrapEntry:
+            raise PermissionError("Original controlled bootstrap required")
+        bootstrap.assert_queued_entry()
+        fusion_version = bootstrap.audit_version
+    else:
+        fusion_version = getattr(adsk.core.Application.get(), "version", "unknown")
     _sdk_version = str(fusion_version)
     log(f"Runtime: Autodesk Fusion {fusion_version}; Python {platform.python_version()}")
 
     try:
-        init_main_thread_dispatch()
+        if bootstrap is None:
+            init_main_thread_dispatch()
     except Exception as exc:
         log(
             f"ERROR: Failed to initialize main-thread dispatch: {exc}",
@@ -222,7 +232,8 @@ def start():
         try:
             starter = threading.Thread(
                 target=_server_start_worker,
-                args=(get_shutdown_flag(),),
+                args=((get_shutdown_flag(), bootstrap) if bootstrap is not None
+                      else (get_shutdown_flag(),)),
                 name="AutodeskFusionMCP-server-start",
                 daemon=True,
             )

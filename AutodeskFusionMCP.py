@@ -18,6 +18,10 @@ def run(context):
 
             bootstrap = BootstrapEntry(os.environ["FUSION_MCP_BOOTSTRAP_INTENT"], __file__)
             bootstrap.before_import()
+            if bootstrap.audited:
+                from .fusion_bridge.dispatch import schedule_bootstrap_entry
+                schedule_bootstrap_entry(bootstrap, context)
+                return
 
         from . import addon_runtime
 

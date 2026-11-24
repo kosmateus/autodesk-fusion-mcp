@@ -26,7 +26,7 @@ intent_file = private / "intent.json"
 intent = {
     "kind": "fmcad-bootstrap-entry-intent", "version": 1, "nonce": "a" * 32,
     "process": {"pid": os.getpid(), "birth": observe_process_birth(os.getpid())},
-    "purpose": "isolated-stdout-v1", "engineVersion": 2,
+    "purpose": "bootstrap-entry-data-v1", "engineVersion": 2,
     "installed": {
         "directory": str(package), "source": "b" * 40,
         "files": {str(p.relative_to(package)).replace(os.sep, "/"): sha(p.read_bytes())
@@ -42,6 +42,7 @@ if scenario == "wrong-profile": intent["profile"]["sha256"] = "0" * 64
 if scenario == "wrong-path": intent["installed"]["directory"] += "/../installed"
 if scenario == "wrong-source": intent["installed"]["source"] = "not-a-pin"
 if scenario == "wrong-purpose": intent["purpose"] = "raw"
+if scenario == "legacy-isolated-purpose": intent["purpose"] = "isolated-stdout-v1"
 if scenario == "boolean-version": intent["version"] = True
 if scenario == "boolean-engine": intent["engineVersion"] = True
 if scenario == "extra-field": intent["fresh"] = True
@@ -226,6 +227,7 @@ class BootstrapEntryTests(unittest.TestCase):
             "malformed", "duplicate-key", "invalid-utf8", "wrong-birth", "wrong-pid",
             "wrong-hash", "wrong-profile", "wrong-path", "wrong-source", "wrong-purpose",
             "boolean-version", "boolean-engine", "extra-field", "traversal", "same-output",
+            "legacy-isolated-purpose",
             "case-alias-output", "reserved-output",
             "reserved-com-output", "reserved-lpt-output", "trailing-dot-output",
             "trailing-space-output",

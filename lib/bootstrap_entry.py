@@ -10,6 +10,8 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
+import sys
+import threading
 
 from .admission_json import decode_json
 from .physical_authority import _read_private_bytes, _check_windows_acl
@@ -61,6 +63,26 @@ def _directory(path):
     return info.st_dev, info.st_ino
 
 
+def _process_image():
+    if sys.platform.startswith("linux"):
+        return Path("/proc/self/exe").resolve()
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD)]
+        image = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(image))
+        if not kernel.QueryFullProcessImageNameW(
+                kernel.GetCurrentProcess(), 0, image, ctypes.byref(size)):
+            _deny()
+        return Path(image.value).resolve()
+    _deny()
+
+
 def _read(path):
     _directory(path.parent)
     return _read_private_bytes(path)
@@ -72,13 +94,19 @@ class BootstrapEntry:
     def __init__(self, intent_path, entry_file):
         self.intent_path = _path(intent_path)
         self.intent_bytes = _read(self.intent_path)
-        self.intent = _exact(decode_json(self.intent_bytes.decode("utf-8")), (
+        value = decode_json(self.intent_bytes.decode("utf-8"))
+        if type(value) is not dict or type(value.get("version")) is not int:
+            _deny()
+        self.audited = value["version"] == 2
+        fields = (
             "kind", "version", "nonce", "process", "purpose", "engineVersion",
-            "installed", "profile", "receipts"))
+            "installed", "profile", "receipts")
+        self.intent = _exact(value, fields + (("executable",) if self.audited else ()))
         intent = self.intent
         if (intent["kind"] != "fmcad-bootstrap-entry-intent"
-                or type(intent["version"]) is not int or intent["version"] != 1
-                or intent["purpose"] != "isolated-stdout-v1"
+                or intent["version"] not in (1, 2)
+                or intent["purpose"] != (
+                    "isolated-stdout-v1" if self.audited else "bootstrap-entry-data-v1")
                 or type(intent["engineVersion"]) is not int or intent["engineVersion"] != 2
                 or type(intent["nonce"]) is not str
                 or re.fullmatch("[0-9a-f]{32}", intent["nonce"]) is None):
@@ -87,6 +115,11 @@ class BootstrapEntry:
         if type(process["pid"]) is not int or process["pid"] != os.getpid():
             _deny()
         _text(process["birth"])
+        self.executable = None
+        if self.audited:
+            executable = _exact(intent["executable"], ("path", "sha256"))
+            self.executable = _path(executable["path"])
+            _digest(executable["sha256"])
         installed = _exact(intent["installed"], ("directory", "source", "files"))
         self.installed = _path(installed["directory"])
         if (self.installed != Path(__file__).resolve().parent.parent
@@ -127,17 +160,31 @@ class BootstrapEntry:
                 or {self.entry_path, self.returned_path} & {self.intent_path, self.profile}):
             _deny()
         self.entry_bytes = None
+        self.returned_bytes = None
+        self.audit_version = None
+        self._begun = False
+        self._scheduled = False
+        self._audit_started = False
+        self._refused = None
+        self._state_lock = threading.Lock()
         self.assert_current()
         if os.path.lexists(self.entry_path) or os.path.lexists(self.returned_path):
             _deny()
 
     def assert_current(self):
+        with self._state_lock:
+            if self._refused is not None:
+                _deny()
         intent = self.intent
         if (os.getpid() != intent["process"]["pid"]
                 or observe_process_birth(os.getpid()) != intent["process"]["birth"]
                 or _read(self.intent_path) != self.intent_bytes
                 or _read(self.profile) != self.profile_bytes
                 or _directory(self.output) != self.output_identity):
+            _deny()
+        if self.audited and (
+                _process_image() != self.executable
+                or _sha(self.executable.read_bytes()) != intent["executable"]["sha256"]):
             _deny()
         # No ignored caches, plugins or extra files: the operator must pin the
         # complete deployed tree. PYTHONDONTWRITEBYTECODE avoids import writes.
@@ -159,11 +206,11 @@ class BootstrapEntry:
         if actual != intent["installed"]["files"]:
             _deny()
 
-    def _write(self, path, phase, entry=None):
+    def _write(self, path, phase, entry=None, audit=None):
         self.assert_current()
         receipt = {
             "kind": "fmcad-bootstrap-entry-receipt",
-            "version": 1,
+            "version": self.intent["version"],
             "phase": phase,
             "nonce": self.intent["nonce"],
             "process": self.intent["process"],
@@ -177,6 +224,10 @@ class BootstrapEntry:
                 "filesDigest": _sha(_encode(self.intent["installed"]["files"]).encode("utf-8")),
             },
         }
+        if self.audited:
+            receipt["executable"] = self.intent["executable"]
+        if audit is not None:
+            receipt["startupAudit"] = audit
         if entry is not None:
             receipt["entry"] = entry
         data = _encode(receipt).encode("utf-8")
@@ -209,12 +260,66 @@ class BootstrapEntry:
         return data
 
     def before_import(self):
-        if self.entry_bytes is not None or os.path.lexists(self.returned_path):
+        if self._begun or self.entry_bytes is not None or os.path.lexists(self.returned_path):
             _deny()
-        self.entry_bytes = self._write(self.entry_path, "entry-before-addon-import")
+        self._begun = True
+        if not self.audited:
+            self.entry_bytes = self._write(self.entry_path, "entry-before-addon-import")
 
     def run_returned(self):
         if self.entry_bytes is None or _read(self.entry_path) != self.entry_bytes:
             _deny()
-        self._write(self.returned_path, "run-returned", {
+        self.returned_bytes = self._write(self.returned_path, "run-returned", {
             "path": str(self.entry_path), "sha256": _sha(self.entry_bytes)})
+
+    def mark_scheduled(self):
+        with self._state_lock:
+            if not self.audited or not self._begun or self._scheduled or self._refused:
+                _deny()
+            self._scheduled = True
+        self.assert_current()
+
+    def refuse(self, reason):
+        with self._state_lock:
+            self._refused = str(reason)
+
+    def begin_sdk_audit(self):
+        with self._state_lock:
+            if self._refused or not self._scheduled or self._audit_started:
+                _deny()
+            self._audit_started = True
+
+    def assert_not_refused(self):
+        with self._state_lock:
+            if self._refused is not None:
+                _deny()
+
+    def assert_queued_entry(self):
+        from ..fusion_bridge.dispatch import assert_startup_queue
+        assert_startup_queue(self)
+        self.assert_current()
+        if (not self.audited or self.entry_bytes is None
+                or _read(self.entry_path) != self.entry_bytes or self.audit_version is None):
+            _deny()
+
+    def assert_ready_for_listener(self):
+        self.assert_current()
+        if (not self.audited or self.entry_bytes is None or self.returned_bytes is None
+                or _read(self.entry_path) != self.entry_bytes
+                or _read(self.returned_path) != self.returned_bytes):
+            _deny()
+
+    def run_queued(self, context):
+        from ..fusion_bridge.dispatch import assert_startup_queue
+        from .startup_audit import collect_startup_audit
+        assert_startup_queue(self)
+        if not self.audited or not self._scheduled or self.entry_bytes is not None:
+            _deny()
+        audit = collect_startup_audit(self)
+        self.audit_version = audit["applicationVersion"]
+        self.entry_bytes = self._write(
+            self.entry_path, "entry-audited-before-addon-import", audit=audit)
+        from .. import addon_runtime
+        if addon_runtime.run(context, bootstrap=self) is not True:
+            _deny()
+        self.run_returned()
