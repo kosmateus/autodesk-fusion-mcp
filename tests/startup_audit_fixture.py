@@ -6,6 +6,7 @@ The fake server never opens a socket; its start method observes startup ordering
 
 import hashlib
 import importlib
+import importlib.abc
 import json
 import os
 from pathlib import Path
@@ -280,10 +281,15 @@ sys.modules.update({"adsk": adsk, "adsk.core": core, "adsk.fusion": adsk.fusion}
 
 # Explicit SDK-free external ports. Producer, entrypoint, addon runtime, bridge
 # runtime, admission-runtime and shared dispatch implementation remain REAL.
-commands = types.ModuleType("audit_fixture.commands")
-commands.start = lambda: (_ for _ in ()).throw(AssertionError("No controlled UI setup"))
-commands.stop = lambda: None
-sys.modules["audit_fixture.commands"] = commands
+class ForbidOptionalCommands(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "audit_fixture.commands" or fullname.startswith("audit_fixture.commands."):
+            events.append("forbidden-commands-import")
+            raise AssertionError("Controlled startup must not even import optional commands")
+        return None
+
+
+sys.meta_path.insert(0, ForbidOptionalCommands())
 server_module = types.ModuleType("audit_fixture.lib.mcp_server")
 
 
@@ -375,6 +381,10 @@ if dispatch is not None:
             events.append("public-spoof-denied")
         else:
             raise AssertionError("Public input bypassed physical admission")
+    if started.is_set() and scenario == "controlled-stop":
+        from audit_fixture import addon_runtime
+        addon_runtime.stop(None)
+        events.append("controlled-stop-returned")
     dispatch.request_main_thread_shutdown()
 
 entry_path = private / "entry.json"

@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 """Autodesk Fusion MCP add-in runtime wiring."""
 
-from . import commands, settings
+from . import settings
 from .fusion_bridge import runtime as fusion_runtime
 from .lib import fusionAddInUtils as futil
 
+commands = None
+
 
 def run(context, *, bootstrap=None):
+    global commands
     del context
     try:
         fusion_runtime.log("Autodesk Fusion MCP starting...")
@@ -20,6 +23,8 @@ def run(context, *, bootstrap=None):
         if bootstrap is None:
             # Controlled startup must not create optional UI commands while
             # qualifying its getter-only bootstrap. Ordinary startup is unchanged.
+            from . import commands as optional_commands
+            commands = optional_commands
             commands.start()
         fusion_runtime.log("[OK] Autodesk Fusion MCP started")
         return True
@@ -35,7 +40,8 @@ def stop(context):
 
     def retired():
         try:
-            commands.stop()
+            if commands is not None:
+                commands.stop()
             futil.clear_handlers()
             fusion_runtime.log("[OK] Autodesk Fusion MCP stopped")
         except Exception:

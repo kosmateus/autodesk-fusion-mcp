@@ -169,3 +169,9 @@ class StartupAuditTests(unittest.TestCase):
         self.assertIsNotNone(facts["entry"], result.stdout)
         self.assertIsNone(facts["returned"])
         self.assertFalse(facts["listener"])
+
+    def test_controlled_start_and_stop_never_import_optional_commands(self):
+        facts, result = self.run_fixture("controlled-stop")
+        self.assertTrue(facts["listener"], result.stdout)
+        self.assertIn("controlled-stop-returned", facts["events"])
+        self.assertNotIn("forbidden-commands-import", facts["events"])
