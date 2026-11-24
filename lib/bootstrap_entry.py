@@ -97,14 +97,17 @@ class BootstrapEntry:
         value = decode_json(self.intent_bytes.decode("utf-8"))
         if type(value) is not dict or type(value.get("version")) is not int:
             _deny()
-        self.audited = value["version"] == 2
+        self.owned_autoload = value["version"] == 3
+        self.audited = value["version"] in (2, 3)
         fields = (
             "kind", "version", "nonce", "process", "purpose", "engineVersion",
             "installed", "profile", "receipts")
-        self.intent = _exact(value, fields + (("executable",) if self.audited else ()))
+        self.intent = _exact(
+            value, fields + (("executable",) if self.audited else ())
+            + (("mode", "provision", "generation") if self.owned_autoload else ()))
         intent = self.intent
         if (intent["kind"] != "fmcad-bootstrap-entry-intent"
-                or intent["version"] not in (1, 2)
+                or intent["version"] not in (1, 2, 3)
                 or intent["purpose"] != (
                     "isolated-stdout-v1" if self.audited else "bootstrap-entry-data-v1")
                 or type(intent["engineVersion"]) is not int or intent["engineVersion"] != 2
@@ -144,6 +147,32 @@ class BootstrapEntry:
         self.profile_bytes = _read(self.profile)
         if _sha(self.profile_bytes) != profile["sha256"]:
             _deny()
+        self.provision = None
+        self.provision_bytes = None
+        if self.owned_autoload:
+            if intent["mode"] != "owned-autoload-v1":
+                _deny()
+            generation = _exact(intent["generation"], ("instance", "epoch"))
+            for value in generation.values():
+                _text(value)
+            provision = _exact(intent["provision"], ("path", "sha256"))
+            self.provision = _path(provision["path"])
+            _digest(provision["sha256"])
+            self.provision_bytes = _read(self.provision)
+            if _sha(self.provision_bytes) != provision["sha256"]:
+                _deny()
+            data = _exact(decode_json(self.provision_bytes.decode("utf-8")), (
+                "database", "pid", "birth", "instance", "epoch", "source", "build",
+                "credentials"))
+            if (type(data["pid"]) is not int or data["pid"] != process["pid"]
+                    or data["birth"] != process["birth"]
+                    or {key: data[key] for key in generation} != generation):
+                _deny()
+            for key in ("birth", "instance", "epoch", "source", "build"):
+                _text(data[key])
+            _path(data["database"])
+            from .admission_http import AdmissionHTTP
+            AdmissionHTTP.validate_credentials(data["credentials"])
         receipts = _exact(intent["receipts"], ("directory", "entry", "returned"))
         self.output = _path(receipts["directory"])
         self.output_identity = _directory(self.output)
@@ -157,7 +186,8 @@ class BootstrapEntry:
         self.entry_path, self.returned_path = (self.output / name for name in names)
         # Output must not alter the full installed manifest or any original input.
         if (self.output == self.installed or self.installed in self.output.parents
-                or {self.entry_path, self.returned_path} & {self.intent_path, self.profile}):
+                or {self.entry_path, self.returned_path}
+                & {self.intent_path, self.profile, self.provision}):
             _deny()
         self.entry_bytes = None
         self.returned_bytes = None
@@ -185,6 +215,10 @@ class BootstrapEntry:
         if self.audited and (
                 _process_image() != self.executable
                 or _sha(self.executable.read_bytes()) != intent["executable"]["sha256"]):
+            _deny()
+        if self.owned_autoload and (
+                os.environ.get("FUSION_MCP_ADMISSION_PROVISION") != str(self.provision)
+                or _read(self.provision) != self.provision_bytes):
             _deny()
         # No ignored caches, plugins or extra files: the operator must pin the
         # complete deployed tree. PYTHONDONTWRITEBYTECODE avoids import writes.
@@ -226,6 +260,9 @@ class BootstrapEntry:
         }
         if self.audited:
             receipt["executable"] = self.intent["executable"]
+        if self.owned_autoload:
+            for key in ("mode", "provision", "generation"):
+                receipt[key] = self.intent[key]
         if audit is not None:
             receipt["startupAudit"] = audit
         if entry is not None:
@@ -316,6 +353,8 @@ class BootstrapEntry:
         if not self.audited or not self._scheduled or self.entry_bytes is not None:
             _deny()
         audit = collect_startup_audit(self)
+        if self.owned_autoload:
+            self._qualify_owned_audit(audit)
         self.audit_version = audit["applicationVersion"]
         self.entry_bytes = self._write(
             self.entry_path, "entry-audited-before-addon-import", audit=audit)
@@ -323,3 +362,31 @@ class BootstrapEntry:
         if addon_runtime.run(context, bootstrap=self) is not True:
             _deny()
         self.run_returned()
+
+    def _qualify_owned_audit(self, audit):
+        """Only the exact pinned fork may auto-start; no JSON grants authority."""
+        own = []
+        manifest = self.intent["installed"]["files"].get("AutodeskFusionMCP.manifest")
+        if manifest is None:
+            _deny()
+
+        for row in audit["scripts"]["items"]:
+            folder = _path(row["folder"])
+            if folder == self.installed:
+                if (not row["isAddIn"] or row["isRunOnStartup"] is not True
+                        or row["isRunning"] is not True
+                        or row["manifest"]["sha256"] != manifest):
+                    _deny()
+                own.append(row)
+            elif (row["isRunning"] is not False
+                    or (row["isAddIn"] and row["isRunOnStartup"] is not False)):
+                _deny()
+        if len(own) != 1:
+            _deny()
+
+    def admission_provision(self):
+        """Return the bound original, never a second ambient provision read."""
+        if not self.owned_autoload:
+            _deny()
+        self.assert_ready_for_listener()
+        return decode_json(self.provision_bytes.decode("utf-8"))

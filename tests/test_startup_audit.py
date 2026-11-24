@@ -21,7 +21,8 @@ class StartupAuditTests(unittest.TestCase):
         package = root / "installed"
         package.mkdir(mode=0o700)
         (root / "private").mkdir(mode=0o700)
-        for name in ("AutodeskFusionMCP.py", "addon_runtime.py", "settings.py", "config.py"):
+        for name in ("AutodeskFusionMCP.py", "AutodeskFusionMCP.manifest",
+                     "addon_runtime.py", "settings.py", "config.py"):
             shutil.copyfile(ROOT / name, package / name)
         for name in ("lib", "fusion_bridge", "commands"):
             shutil.copytree(ROOT / name, package / name,
@@ -175,3 +176,97 @@ class StartupAuditTests(unittest.TestCase):
         self.assertTrue(facts["listener"], result.stdout)
         self.assertIn("controlled-stop-returned", facts["events"])
         self.assertNotIn("forbidden-commands-import", facts["events"])
+
+    def test_owned_v3_binds_originals_and_audits_exact_fork_before_listener(self):
+        for scenario in ("valid", "foreign-addin-off", "controlled-stop", "public-spoof"):
+            with self.subTest(scenario=scenario):
+                facts, result = self.run_fixture("owned-" + scenario)
+                self.assertTrue(facts["listener"], result.stdout + result.stderr)
+                entry, returned = facts["entry"], facts["returned"]
+                self.assertEqual(entry["version"], 3)
+                self.assertEqual(entry["mode"], "owned-autoload-v1")
+                self.assertEqual(set(entry), {
+                    "kind", "version", "phase", "nonce", "process", "purpose",
+                    "engineVersion", "intent", "profile", "installed", "executable",
+                    "mode", "provision", "generation", "startupAudit"})
+                self.assertEqual(set(returned), (set(entry) - {"startupAudit"}) | {"entry"})
+                self.assertEqual(entry["provision"], facts["originalIntent"]["provision"])
+                self.assertEqual(entry["generation"],
+                                 {"instance": "fixture-instance", "epoch": "fixture-epoch"})
+                for key in ("mode", "provision", "generation", "executable", "intent"):
+                    self.assertEqual(entry[key], returned[key])
+                self.assertEqual(returned["entry"]["sha256"], facts["entrySha256"])
+                self.assertEqual(entry["intent"]["sha256"], facts["originalIntentSha256"])
+                rows = entry["startupAudit"]["scripts"]["items"]
+                self.assertEqual(rows[0]["folder"], entry["installed"]["directory"])
+                self.assertTrue(rows[0]["isRunOnStartup"])
+                self.assertTrue(rows[0]["isRunning"])
+                self.assertFalse(rows[1]["isRunning"])
+                self.assertLess(facts["events"].index("getter:manifestContent"),
+                                facts["events"].index("vendor-utility-ui-getter"))
+                self.assertNotIn("startupAudit", returned)
+
+    def test_owned_v3_closed_intent_and_provision_fail_before_any_sdk(self):
+        for scenario in (
+            "bad-intent", "bad-executable", "bad-mode", "bad-version",
+            "boolean-version", "boolean-engine",
+            "v2-with-owned-fields", "missing-mode", "missing-provision",
+            "missing-generation", "missing-epoch", "extra-field", "extra-generation",
+            "boolean-generation", "bad-generation", "bad-provision-hash",
+            "extra-provision", "missing-provision-sha", "boolean-mode",
+            "provision-extra", "provision-pid",
+            "provision-boolean-pid", "provision-birth", "provision-generation",
+            "provision-credentials", "provision-database", "provision-source",
+            "provision-missing-build", "provision-duplicate", "provision-malformed",
+            "public-provision",
+            "receipt-overwrites-provision", "missing-provision-env", "wrong-provision-env",
+        ):
+            with self.subTest(scenario=scenario):
+                facts, result = self.run_fixture("owned-" + scenario)
+                self.assertEqual(facts["events"], [], result.stdout + result.stderr)
+                self.assertFalse(facts["listener"])
+                self.assertIsNone(facts["entry"])
+                self.assertIsNone(facts["returned"])
+
+    def test_owned_v3_foreign_startup_and_running_or_wrong_fork_fail_closed(self):
+        for scenario in (
+            "foreign-startup", "foreign-running", "own-startup-off", "own-not-running",
+            "wrong-own-manifest", "duplicate-own", "missing-own", "empty", "own-is-script",
+            "provision-change", "provision-env-change",
+        ):
+            with self.subTest(scenario=scenario):
+                facts, result = self.run_fixture("owned-" + scenario)
+                self.assertFalse(facts["listener"], result.stdout + result.stderr)
+                self.assertIsNone(facts["entry"])
+                self.assertIsNone(facts["returned"])
+                self.assertNotIn("vendor-utility-ui-getter", facts["events"])
+
+    def test_owned_v3_entry_failure_never_imports_or_opens_listener(self):
+        for scenario in ("source-before-event", "addon-import-failure", "entry-tamper",
+                         "timeout-before-event", "replay", "queue-lock-held"):
+            with self.subTest(scenario=scenario):
+                facts, result = self.run_fixture("owned-" + scenario)
+                if scenario in ("replay", "queue-lock-held"):
+                    self.assertTrue(facts["listener"], result.stdout + result.stderr)
+                    self.assertEqual(facts["events"].count("getter:scripts"), 1)
+                else:
+                    self.assertFalse(facts["listener"], result.stdout + result.stderr)
+                    self.assertIsNone(facts["returned"])
+
+    def test_owned_v3_original_provision_is_rechecked_at_listener_boundary(self):
+        for scenario in ("provision-before-listener", "provision-env-before-listener"):
+            with self.subTest(scenario=scenario):
+                facts, result = self.run_fixture("owned-" + scenario)
+                self.assertFalse(facts["listener"], result.stdout + result.stderr)
+                self.assertIsNotNone(facts["entry"])
+                self.assertIsNotNone(facts["returned"])
+                self.assertIn("server-construct", facts["events"])
+                self.assertNotIn("listener-start", facts["events"])
+
+    def test_owned_v3_existing_original_receipts_are_never_overwritten(self):
+        for name in ("entry", "returned"):
+            with self.subTest(name=name):
+                facts, result = self.run_fixture("owned-preexisting-" + name)
+                self.assertEqual(facts[name], {"original": "must survive"})
+                self.assertFalse(facts["listener"], result.stdout + result.stderr)
+                self.assertEqual(facts["events"], [])

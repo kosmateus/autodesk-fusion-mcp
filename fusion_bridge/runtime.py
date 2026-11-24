@@ -101,7 +101,7 @@ def create_server(dispatch, *, admission_api=None, physical_authority=None):
     return server
 
 
-def _start_server(shutdown_flag):
+def _start_server(shutdown_flag, bootstrap=None):
     global _server, _admission
 
     if _server and _server.is_running:
@@ -111,10 +111,13 @@ def _start_server(shutdown_flag):
     log(f"Starting MCP server on port {settings.MCP_SERVER_PORT}...")
     attempt = 0
     dispatch = bind_dispatch(shutdown_flag)
-    admission = AdmissionRuntime.from_environment(
-        dispatch, shutdown=shutdown_flag, version=_sdk_version,
-        endpoint=f"http://127.0.0.1:{settings.MCP_SERVER_PORT}/mcp",
-    )
+    options = dict(
+        shutdown=shutdown_flag, version=_sdk_version,
+        endpoint=f"http://127.0.0.1:{settings.MCP_SERVER_PORT}/mcp")
+    if bootstrap is not None:
+        admission = AdmissionRuntime(bootstrap.admission_provision(), dispatch, **options)
+    else:
+        admission = AdmissionRuntime.from_environment(dispatch, **options)
     try:
         server = create_server(dispatch, admission_api=admission.http if admission else None,
                                physical_authority=admission.physical if admission else None)
@@ -123,16 +126,20 @@ def _start_server(shutdown_flag):
             admission.close()
         raise
     try:
+        if bootstrap is not None:
+            return _listen(server, admission, shutdown_flag, attempt, bootstrap=bootstrap)
         return _listen(server, admission, shutdown_flag, attempt)
     finally:
         if admission is not None and _admission is not admission:
             admission.close()
 
 
-def _listen(server, admission, shutdown_flag, attempt):
+def _listen(server, admission, shutdown_flag, attempt, bootstrap=None):
     global _server, _admission
     while not shutdown_flag.is_set():
         try:
+            if bootstrap is not None:
+                bootstrap.assert_ready_for_listener()
             server.start()
             _server, _admission = server, admission
             if admission is not None:
@@ -190,7 +197,11 @@ def _server_start_worker(shutdown_flag=None, bootstrap=None):
         try:
             if bootstrap is not None:
                 bootstrap.assert_ready_for_listener()
-            if not _start_server(shutdown_flag):
+            if bootstrap is not None and bootstrap.owned_autoload:
+                running = _start_server(shutdown_flag, bootstrap=bootstrap)
+            else:
+                running = _start_server(shutdown_flag)
+            if not running:
                 request_main_thread_shutdown(shutdown_flag)
         except Exception as exc:
             log(
