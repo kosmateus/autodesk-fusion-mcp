@@ -19,6 +19,15 @@ import types
 
 root = Path(sys.argv[1])
 scenario = sys.argv[2]
+ignored_bytecode_env = len(sys.argv) > 3 and sys.argv[3] == "ignored-bytecode-env"
+initial_bytecode_policy = sys.dont_write_bytecode
+if ignored_bytecode_env:
+    assert sys.flags.ignore_environment == 1
+    assert os.environ["PYTHONDONTWRITEBYTECODE"] == "1"
+    assert initial_bytecode_policy is False, "Child must not inherit a -B policy"
+    # Fixture preparation is not Fusion entry. Do not warm its source tree with
+    # cache, then unload these setup-only modules before the real cold imports.
+    sys.dont_write_bytecode = True
 owned = scenario.startswith("owned-")
 if owned:
     scenario = scenario[len("owned-"):]
@@ -434,8 +443,37 @@ operations = types.ModuleType("audit_fixture.fusion_bridge.operations")
 operations.TOOL_HANDLERS = {}
 sys.modules["audit_fixture.fusion_bridge.operations"] = operations
 
-entrypoint = importlib.import_module("audit_fixture.AutodeskFusionMCP")
+if ignored_bytecode_env:
+    for name in sorted(tuple(sys.modules), key=len, reverse=True):
+        if (name != "audit_fixture.lib.mcp_server"
+                and (name == "audit_fixture.lib" or name.startswith("audit_fixture.lib."))):
+            module = sys.modules.pop(name)
+            parent, _, attribute = name.rpartition(".")
+            owner = sys.modules.get(parent)
+            if owner is not None and getattr(owner, attribute, None) is module:
+                delattr(owner, attribute)
+    assert not list(package.rglob("*.pyc"))
+    if scenario == "preexisting-cache":
+        cache = package / "lib" / "__pycache__"
+        cache.mkdir(mode=0o700)
+        (cache / "unlisted.cpython-314.pyc").write_bytes(b"ORIGINAL-UNLISTED-CACHE")
+        (cache / "unlisted.cpython-314.pyc").chmod(0o600)
+    sys.dont_write_bytecode = False
+    # Fusion loads the entry itself without a top-level pyc in the observed
+    # failure. Reproduce that external loader boundary, not an importlib cache.
+    entrypoint = types.ModuleType("audit_fixture.AutodeskFusionMCP")
+    entrypoint.__package__ = "audit_fixture"
+    entrypoint.__file__ = str(package / "AutodeskFusionMCP.py")
+    sys.modules[entrypoint.__name__] = entrypoint
+    exec(compile((package / "AutodeskFusionMCP.py").read_bytes(),
+                 entrypoint.__file__, "exec"), entrypoint.__dict__)
+else:
+    entrypoint = importlib.import_module("audit_fixture.AutodeskFusionMCP")
 entrypoint.run({"ownedFixture": True})
+policy_after_entry = sys.dont_write_bytecode
+if ignored_bytecode_env and "audit_fixture.lib.physical_authority" in sys.modules:
+    # External fixture port; never the real host authority directory.
+    sys.modules["audit_fixture.lib.physical_authority"].authority_directory = lambda: private / "physical"
 dispatch = sys.modules.get("audit_fixture.fusion_bridge.dispatch")
 if dispatch is not None:
     # The real event queue is pumped ONLY by this main thread. Disable periodic
@@ -505,4 +543,10 @@ print("FIXTURE_RESULT=" + json.dumps({
     "originalIntentSha256": sha(json.dumps(intent).encode()),
     "originalIntent": intent,
     "sdk": "EXPLICIT_FAKE_ONLY", "network": "NONE", "errors": errors,
+    "bytecode": {
+        "ignoreEnvironment": sys.flags.ignore_environment,
+        "initial": initial_bytecode_policy, "afterEntry": policy_after_entry,
+        "afterDeferred": sys.dont_write_bytecode,
+        "files": sorted(p.relative_to(package).as_posix() for p in package.rglob("*.pyc")),
+    },
 }))

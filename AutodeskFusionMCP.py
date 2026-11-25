@@ -14,6 +14,11 @@ def run(context):
 
         bootstrap = None
         if "FUSION_MCP_BOOTSTRAP_INTENT" in os.environ:
+            import sys
+
+            # Embedded hosts may ignore PYTHONDONTWRITEBYTECODE. Preserve the
+            # pinned tree through deferred imports too; this is not admission.
+            sys.dont_write_bytecode = True
             from .lib.bootstrap_entry import BootstrapEntry
 
             bootstrap = BootstrapEntry(os.environ["FUSION_MCP_BOOTSTRAP_INTENT"], __file__)
