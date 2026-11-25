@@ -20,6 +20,7 @@ import types
 root = Path(sys.argv[1])
 scenario = sys.argv[2]
 ignored_bytecode_env = len(sys.argv) > 3 and sys.argv[3] == "ignored-bytecode-env"
+loader_spelling = sys.argv[4] if len(sys.argv) > 4 else "native"
 initial_bytecode_policy = sys.dont_write_bytecode
 if ignored_bytecode_env:
     assert sys.flags.ignore_environment == 1
@@ -136,6 +137,8 @@ if scenario == "bad-intent":
     intent["process"]["birth"] += "-wrong"
 if scenario == "bad-executable":
     intent["executable"]["sha256"] = "0" * 64
+if scenario == "noncanonical-profile-path":
+    intent["profile"]["path"] = str(private) + "/profile.json"
 intent_file.write_text(json.dumps(intent))
 intent_file.chmod(0o600)
 os.environ["FUSION_MCP_BOOTSTRAP_INTENT"] = str(intent_file)
@@ -464,6 +467,22 @@ if ignored_bytecode_env:
     entrypoint = types.ModuleType("audit_fixture.AutodeskFusionMCP")
     entrypoint.__package__ = "audit_fixture"
     entrypoint.__file__ = str(package / "AutodeskFusionMCP.py")
+    if loader_spelling == "forward-slash":
+        entrypoint.__file__ = entrypoint.__file__.replace("\\", "/")
+    elif loader_spelling == "relative":
+        entrypoint.__file__ = "AutodeskFusionMCP.py"
+    elif loader_spelling == "parent-alias":
+        entrypoint.__file__ = str(package / ".." / "installed" / "AutodeskFusionMCP.py")
+    elif loader_spelling == "different-entry":
+        entrypoint.__file__ = str(package / "addon_runtime.py")
+    elif loader_spelling == "linked-parent":
+        alias = root / "loader-alias"
+        if os.name == "nt":
+            import _winapi
+            _winapi.CreateJunction(str(package), str(alias))
+        else:
+            alias.symlink_to(package, target_is_directory=True)
+        entrypoint.__file__ = str(alias / "AutodeskFusionMCP.py").replace("\\", "/")
     sys.modules[entrypoint.__name__] = entrypoint
     exec(compile((package / "AutodeskFusionMCP.py").read_bytes(),
                  entrypoint.__file__, "exec"), entrypoint.__dict__)

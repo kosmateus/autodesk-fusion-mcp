@@ -34,7 +34,7 @@ print("ORDINARY_RESULT=" + json.dumps({
 
 
 class EntryBytecodeTests(unittest.TestCase):
-    def fixture(self, scenario):
+    def fixture(self, scenario, loader_spelling="native"):
         temporary = tempfile.TemporaryDirectory(prefix="entry-bytecode-owned-")
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
@@ -51,7 +51,7 @@ class EntryBytecodeTests(unittest.TestCase):
             file.chmod(0o700 if file.is_dir() else 0o600)
         result = subprocess.run(
             [sys.executable, "-I", "-S", "-c", AUDIT_RUNNER,
-             str(root), scenario, "ignored-bytecode-env"],
+              str(root), scenario, "ignored-bytecode-env", loader_spelling],
             env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
             capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -79,6 +79,40 @@ class EntryBytecodeTests(unittest.TestCase):
         self.assertEqual(facts["entry"]["version"], 2)
         self.assertEqual(facts["bytecode"]["files"], [])
         self.assertTrue(facts["bytecode"]["afterDeferred"])
+
+    def test_owned_loader_forward_slashes_keep_original_receipt_pair(self):
+        facts, result, _ = self.fixture("owned-valid", "forward-slash")
+        self.assertTrue(facts["listener"], result.stdout + result.stderr)
+        self.assertEqual(facts["entry"]["version"], 3)
+        self.assertEqual(facts["returned"]["phase"], "run-returned")
+        self.assertEqual(facts["bytecode"]["files"], [])
+
+    def test_manual_v2_loader_forward_slashes_keep_original_receipt_pair(self):
+        facts, result, _ = self.fixture("valid", "forward-slash")
+        self.assertTrue(facts["listener"], result.stdout + result.stderr)
+        self.assertEqual(facts["entry"]["version"], 2)
+        self.assertEqual(facts["returned"]["phase"], "run-returned")
+        self.assertEqual(facts["bytecode"]["files"], [])
+
+    def test_loader_relative_parent_alias_and_different_entry_are_refused(self):
+        for spelling in ("relative", "parent-alias", "different-entry", "linked-parent"):
+            with self.subTest(spelling=spelling):
+                facts, result, _ = self.fixture("owned-valid", spelling)
+                self.assertFalse(facts["listener"], result.stdout + result.stderr)
+                self.assertIsNone(facts["entry"])
+                self.assertIsNone(facts["returned"])
+                self.assertEqual(facts["events"], [])
+                self.assertEqual(facts["bytecode"]["files"], [])
+
+    @unittest.skipUnless(os.name == "nt", "Windows intent path spelling contract")
+    def test_loader_normalization_does_not_normalize_intent_paths(self):
+        facts, result, _ = self.fixture(
+            "owned-noncanonical-profile-path", "forward-slash")
+        self.assertFalse(facts["listener"], result.stdout + result.stderr)
+        self.assertIsNone(facts["entry"])
+        self.assertIsNone(facts["returned"])
+        self.assertEqual(facts["events"], [])
+        self.assertEqual(facts["bytecode"]["files"], [])
 
     def test_preexisting_cache_is_not_ignored_removed_or_authorized(self):
         facts, result, package = self.fixture("owned-preexisting-cache")

@@ -21,7 +21,11 @@ def run(context):
             sys.dont_write_bytecode = True
             from .lib.bootstrap_entry import BootstrapEntry
 
-            bootstrap = BootstrapEntry(os.environ["FUSION_MCP_BOOTSTRAP_INTENT"], __file__)
+            # Fusion's loader may spell Windows __file__ with forward slashes.
+            # Normalize separators only; keep strict path/identity validation.
+            bootstrap = BootstrapEntry(
+                os.environ["FUSION_MCP_BOOTSTRAP_INTENT"],
+                __file__.replace("/", os.sep))
             bootstrap.before_import()
             if bootstrap.audited:
                 from .fusion_bridge.dispatch import schedule_bootstrap_entry
