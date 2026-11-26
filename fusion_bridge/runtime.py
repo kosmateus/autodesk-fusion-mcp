@@ -101,7 +101,7 @@ def create_server(dispatch, *, admission_api=None, physical_authority=None):
     return server
 
 
-def _start_server(shutdown_flag):
+def _start_server(shutdown_flag, bootstrap=None):
     global _server, _admission
 
     if _server and _server.is_running:
@@ -111,10 +111,13 @@ def _start_server(shutdown_flag):
     log(f"Starting MCP server on port {settings.MCP_SERVER_PORT}...")
     attempt = 0
     dispatch = bind_dispatch(shutdown_flag)
-    admission = AdmissionRuntime.from_environment(
-        dispatch, shutdown=shutdown_flag, version=_sdk_version,
-        endpoint=f"http://127.0.0.1:{settings.MCP_SERVER_PORT}/mcp",
-    )
+    options = dict(
+        shutdown=shutdown_flag, version=_sdk_version,
+        endpoint=f"http://127.0.0.1:{settings.MCP_SERVER_PORT}/mcp")
+    if bootstrap is not None:
+        admission = AdmissionRuntime(bootstrap.admission_provision(), dispatch, **options)
+    else:
+        admission = AdmissionRuntime.from_environment(dispatch, **options)
     try:
         server = create_server(dispatch, admission_api=admission.http if admission else None,
                                physical_authority=admission.physical if admission else None)
@@ -123,16 +126,20 @@ def _start_server(shutdown_flag):
             admission.close()
         raise
     try:
+        if bootstrap is not None:
+            return _listen(server, admission, shutdown_flag, attempt, bootstrap=bootstrap)
         return _listen(server, admission, shutdown_flag, attempt)
     finally:
         if admission is not None and _admission is not admission:
             admission.close()
 
 
-def _listen(server, admission, shutdown_flag, attempt):
+def _listen(server, admission, shutdown_flag, attempt, bootstrap=None):
     global _server, _admission
     while not shutdown_flag.is_set():
         try:
+            if bootstrap is not None:
+                bootstrap.assert_ready_for_listener()
             server.start()
             _server, _admission = server, admission
             if admission is not None:
@@ -161,7 +168,7 @@ def _listen(server, admission, shutdown_flag, attempt):
     return True
 
 
-def _server_start_worker(shutdown_flag=None):
+def _server_start_worker(shutdown_flag=None, bootstrap=None):
     """Bind the MCP port only once Fusion's main thread is pumping events.
 
     During a cold start Fusion auto-loads add-ins before its event loop is
@@ -188,7 +195,13 @@ def _server_start_worker(shutdown_flag=None):
         if shutdown_flag.is_set():
             return
         try:
-            if not _start_server(shutdown_flag):
+            if bootstrap is not None:
+                bootstrap.assert_ready_for_listener()
+            if bootstrap is not None and bootstrap.owned_autoload:
+                running = _start_server(shutdown_flag, bootstrap=bootstrap)
+            else:
+                running = _start_server(shutdown_flag)
+            if not running:
                 request_main_thread_shutdown(shutdown_flag)
         except Exception as exc:
             log(
@@ -199,17 +212,25 @@ def _server_start_worker(shutdown_flag=None):
             request_main_thread_shutdown(shutdown_flag)
 
 
-def start():
+def start(*, bootstrap=None):
     global _sdk_version
     _require_main_thread()
     version_info = python_exec.get_version_info(python_exec.get_addin_dir())
     log(f"MCP Integration starting... add-in {version_info}")
-    fusion_version = getattr(adsk.core.Application.get(), "version", "unknown")
+    if bootstrap is not None:
+        from ..lib.bootstrap_entry import BootstrapEntry
+        if type(bootstrap) is not BootstrapEntry:
+            raise PermissionError("Original controlled bootstrap required")
+        bootstrap.assert_queued_entry()
+        fusion_version = bootstrap.audit_version
+    else:
+        fusion_version = getattr(adsk.core.Application.get(), "version", "unknown")
     _sdk_version = str(fusion_version)
     log(f"Runtime: Autodesk Fusion {fusion_version}; Python {platform.python_version()}")
 
     try:
-        init_main_thread_dispatch()
+        if bootstrap is None:
+            init_main_thread_dispatch()
     except Exception as exc:
         log(
             f"ERROR: Failed to initialize main-thread dispatch: {exc}",
@@ -222,7 +243,8 @@ def start():
         try:
             starter = threading.Thread(
                 target=_server_start_worker,
-                args=(get_shutdown_flag(),),
+                args=((get_shutdown_flag(), bootstrap) if bootstrap is not None
+                      else (get_shutdown_flag(),)),
                 name="AutodeskFusionMCP-server-start",
                 daemon=True,
             )
