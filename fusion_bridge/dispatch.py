@@ -11,7 +11,6 @@ from datetime import datetime
 import adsk.core
 
 from .. import settings
-from ..lib import fusionAddInUtils as futil
 from ..lib.admission_receiver import AdmissionTargetError
 from ..lib.physical_authority import PhysicalCapability, PhysicalTurn
 
@@ -28,6 +27,21 @@ _running_handlers = 0
 _running_signals = 0
 _deferred_retirement = None
 _lifecycle_poll = None
+_startup_entry = None
+_startup_ticket = None
+
+
+def _logging_utils():
+    # Importing the vendor utility reads Application/userInterface. Controlled
+    # startup imports this dispatcher before its audit, so defer that import.
+    from ..lib import fusionAddInUtils
+    return fusionAddInUtils
+
+
+def __getattr__(name):
+    if name == "futil":  # Preserve the existing logging integration/test seam.
+        return _logging_utils()
+    raise AttributeError(name)
 
 
 def set_lifecycle_poll(callback):
@@ -81,6 +95,7 @@ def log(message: str, level=None):
     """
     stamped = f"{datetime.now().isoformat(timespec='milliseconds')} {message}"
     if threading.current_thread() is threading.main_thread():
+        futil = _logging_utils()
         futil.log(stamped) if level is None else futil.log(stamped, level)
         return
     with _msg_lock:
@@ -95,6 +110,7 @@ def drain_logs():
         snapshot = list(_deferred_messages)
         _deferred_messages.clear()
     for text, lvl in snapshot:
+        futil = _logging_utils()
         futil.log(text) if lvl is None else futil.log(text, lvl)
 
 
@@ -215,6 +231,98 @@ def _new_envelope(call_data, reply):
         "_lock": threading.Lock(),
         "_state": "queued",
     }
+
+
+def assert_startup_queue(entry):
+    """Internal origin and queue-context check, never dispatch authority."""
+    with _lifecycle_lock:
+        if (threading.current_thread() is not threading.main_thread()
+                or not _run_lock.locked() or _startup_entry is not entry
+                or _startup_ticket is None or _halt.is_set()):
+            raise PermissionError("Startup audit requires its original shared-queue turn")
+
+
+def schedule_bootstrap_entry(entry, context):
+    """One fixed startup operation, not a public tool or arbitrary callback."""
+    from ..lib.bootstrap_entry import BootstrapEntry
+    global _startup_ticket
+    if type(entry) is not BootstrapEntry or not entry.audited:
+        raise PermissionError("Original audited BootstrapEntry required")
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError("Controlled bootstrap scheduling requires the main thread")
+    entry.mark_scheduled()
+    # Only the reviewed custom-event registration/signal minimum precedes audit.
+    init_main_thread_dispatch()
+    shutdown = _halt
+    envelope = _new_envelope({}, queue.Queue(maxsize=1))
+    envelope["_shutdown"] = shutdown
+    envelope["_bootstrap_entry"] = entry
+    envelope["_bootstrap_context"] = context
+
+    def expired():
+        with envelope["_lock"]:
+            if envelope["_state"] == "done":
+                return
+            entry.refuse("BOOTSTRAP_STARTUP_AUDIT_QUEUE_TIMEOUT")
+            entry.report_failure("queue-timeout", TimeoutError())
+            if envelope["_state"] == "queued":
+                _try_remove(envelope)
+                envelope["_state"] = "cancelled"
+        request_main_thread_shutdown(shutdown)
+        print("[AutodeskFusionMCP] Controlled startup UNKNOWN: audit queue timeout")
+
+    timer = threading.Timer(settings.MCP_MAIN_THREAD_TIMEOUT, expired)
+    timer.daemon = True
+    envelope["_bootstrap_timer"] = timer
+    with _lifecycle_lock:
+        if _startup_ticket is not None or shutdown.is_set() or not _registered:
+            raise PermissionError("Controlled startup already scheduled or unavailable")
+        _startup_ticket = envelope
+        _pending.put(envelope)
+    timer.start()
+    try:
+        if not _fire_signal(shutdown):
+            raise RuntimeError("Controlled startup signal refused")
+    except BaseException:
+        timer.cancel()
+        entry.refuse("BOOTSTRAP_STARTUP_AUDIT_QUEUE_SIGNAL_FAILED")
+        request_main_thread_shutdown(shutdown)
+        raise
+
+
+def _consume_bootstrap_entry(envelope):
+    """Runs under the same _run_lock/lifecycle count as ordinary SDK handlers."""
+    from ..lib.bootstrap_entry import BootstrapEntry
+    global _startup_entry, _running_handlers
+    entry = envelope["_bootstrap_entry"]
+    try:
+        with envelope["_lock"]:
+            if envelope["_state"] != "queued":
+                return
+            envelope["_state"] = "running"
+        with _lifecycle_lock:
+            if (type(entry) is not BootstrapEntry or _startup_ticket is not envelope
+                    or envelope["_shutdown"] is not _halt or _halt.is_set()
+                    or _startup_entry is not None
+                    or threading.current_thread() is not threading.main_thread()):
+                raise PermissionError("Controlled startup queue origin changed")
+            _startup_entry = entry
+            _running_handlers += 1
+        try:
+            entry.run_queued(envelope["_bootstrap_context"])
+        finally:
+            with _lifecycle_lock:
+                _startup_entry = None
+                _running_handlers -= 1
+    except BaseException as exc:
+        entry.report_failure("audit", exc)
+        entry.refuse(str(exc))
+        request_main_thread_shutdown(envelope["_shutdown"])
+        print("[AutodeskFusionMCP] Controlled startup refused/UNKNOWN; private diagnostic only")
+    finally:
+        envelope["_bootstrap_timer"].cancel()
+        with envelope["_lock"]:
+            envelope["_state"] = "done"
 
 
 def _put_reply(reply, result):
@@ -537,6 +645,11 @@ def _flush_pending():
                 processed += 1
                 continue
 
+            if "_bootstrap_entry" in envelope:
+                _consume_bootstrap_entry(envelope)
+                processed += 1
+                continue
+
             # The readiness ping is answered here, before any tool routing,
             # so it succeeds even while the tool handler is not installed
             # (cold start, add-in not fully running).
@@ -624,13 +737,14 @@ def _flush_pending():
 
 
 def init_main_thread_dispatch():
-    global _callback_event, _registered, _halt
+    global _callback_event, _registered, _halt, _startup_ticket
 
     with _lifecycle_lock:
         if _registered or _running_handlers or _running_signals:
             raise RuntimeError("The prior main-thread dispatch is not retired")
         # A stopped generation stays stopped, even after a fast restart.
         _halt = threading.Event()
+        _startup_ticket = None
     _scheduler_active.clear()
     _callback_event = get_app().registerCustomEvent(CALLBACK_EVENT_ID)
     handler = _BridgeEventHandler(_halt)
