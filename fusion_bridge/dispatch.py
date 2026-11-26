@@ -264,6 +264,7 @@ def schedule_bootstrap_entry(entry, context):
             if envelope["_state"] == "done":
                 return
             entry.refuse("BOOTSTRAP_STARTUP_AUDIT_QUEUE_TIMEOUT")
+            entry.report_failure("queue-timeout", TimeoutError())
             if envelope["_state"] == "queued":
                 _try_remove(envelope)
                 envelope["_state"] = "cancelled"
@@ -314,9 +315,10 @@ def _consume_bootstrap_entry(envelope):
                 _startup_entry = None
                 _running_handlers -= 1
     except BaseException as exc:
+        entry.report_failure("audit", exc)
         entry.refuse(str(exc))
         request_main_thread_shutdown(envelope["_shutdown"])
-        print(f"[AutodeskFusionMCP] Controlled startup refused/UNKNOWN: {exc}")
+        print("[AutodeskFusionMCP] Controlled startup refused/UNKNOWN; private diagnostic only")
     finally:
         envelope["_bootstrap_timer"].cancel()
         with envelope["_lock"]:

@@ -302,5 +302,225 @@ class BootstrapEntryTests(unittest.TestCase):
         self.assertIn("Failed to start", result.stdout)
 
 
+class BootstrapDiagnosticTests(unittest.TestCase):
+    """Real private writer/entrypoint, explicit offline scheduling/SDK ports."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib
+        import types
+        package = types.ModuleType("diagnostic_fixture_addin")
+        package.__path__ = [str(ROOT)]
+        sys.modules[package.__name__] = package
+        cls.package = package.__name__
+        cls.entry_module = importlib.import_module(cls.package + ".lib.bootstrap_entry")
+        cls.boot = importlib.import_module(cls.package + ".AutodeskFusionMCP")
+
+    def setUp(self):
+        from unittest.mock import patch
+        self.patch = patch
+        temporary = tempfile.TemporaryDirectory(prefix="bootstrap-diagnostic-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.root.chmod(0o700)
+        if os.name == "nt":
+            import csv
+            sid = list(csv.reader(subprocess.check_output(
+                ["whoami.exe", "/user", "/fo", "csv", "/nh"], text=True).strip().splitlines()))[0][1]
+            subprocess.run(["icacls.exe", str(self.root), "/inheritance:r", "/grant:r",
+                            "*" + sid + ":(OI)(CI)F", "*S-1-5-18:(OI)(CI)F",
+                            "*S-1-5-32-544:(OI)(CI)F"], check=True, capture_output=True)
+        self.intent_path = self.root / "intent.json"
+        self.enterContext(patch.dict(os.environ, FUSION_MCP_BOOTSTRAP_INTENT=str(self.intent_path)))
+        self.intent = {
+            "kind": "fmcad-bootstrap-entry-intent", "version": 3, "mode": "owned-autoload-v1",
+            "nonce": "a" * 32, "purpose": "isolated-stdout-v1", "engineVersion": 2,
+            "process": {"pid": os.getpid(), "birth": self.entry_module.observe_process_birth(os.getpid())},
+            "installed": {}, "profile": {}, "receipts": {}, "executable": {},
+            "provision": {}, "generation": {},
+        }
+        self.write_intent()
+
+    def write_intent(self):
+        self.intent_path.write_text(json.dumps(self.intent))
+        self.intent_path.chmod(0o600)
+
+    def report(self, phase="constructor", error=None):
+        return self.entry_module.report_bootstrap_failure(
+            str(self.intent_path), phase, error or ValueError("SECRET-TOKEN /private/user/intent"))
+
+    def artifacts(self):
+        return list(self.root.glob("bootstrap-failure-*.json"))
+
+    def test_private_sanitized_facts_not_receipt_and_no_secret_fields(self):
+        namespace = {}
+        exec(compile("def SECRET_TOKEN_FUNCTION():\n raise ValueError('SECRET_TOKEN_MESSAGE')",
+                     "/SECRET_TOKEN_DIRECTORY/SECRET_TOKEN_FILE.py", "exec"), namespace)
+        try:
+            namespace["SECRET_TOKEN_FUNCTION"]()
+        except ValueError as error:
+            self.assertTrue(self.report(error=error))
+        files = self.artifacts()
+        self.assertEqual(len(files), 1)
+        raw = files[0].read_text()
+        data = json.loads(raw)
+        self.assertNotIn("SECRET_TOKEN", raw)
+        self.assertNotIn(str(self.root), raw)
+        self.assertEqual(data["phase"], "constructor")
+        self.assertEqual(data["exceptionClass"], "ValueError")
+        self.assertEqual(data["authority"], "NONE")
+        self.assertFalse(data["receipt"])
+        self.assertFalse(data["ready"])
+        self.assertEqual(data["historicalOutcome"], "UNKNOWN_UNCHANGED")
+        self.assertTrue(data["stack"])
+        self.assertEqual(set(data["stack"][0]), {"file", "function", "line"})
+        self.assertFalse((self.root / "entry.json").exists())
+        self.assertFalse((self.root / "returned.json").exists())
+        self.entry_module._read(files[0])  # Real private ACL/regular-file reader.
+        if os.name != "nt":
+            self.assertEqual(files[0].stat().st_mode & 0o777, 0o600)
+
+    def test_invalid_process_intent_and_paths_never_publish(self):
+        original = json.loads(json.dumps(self.intent))
+        for change in [
+            lambda i: i["process"].update(pid=os.getpid() + 1),
+            lambda i: i["process"].update(birth="wrong"),
+            lambda i: i.update(nonce="../outside"),
+            lambda i: i.update(version=1),
+            lambda i: i.update(extra=True),
+        ]:
+            self.intent = json.loads(json.dumps(original))
+            change(self.intent)
+            self.write_intent()
+            self.assertFalse(self.report())
+            self.assertEqual(self.artifacts(), [])
+        self.intent = original
+        self.write_intent()
+        with self.patch.object(self.entry_module, "observe_process_birth", side_effect=OSError("SECRET")):
+            self.assertFalse(self.report())
+        with self.patch.object(self.entry_module, "_check_windows_acl", side_effect=PermissionError("SECRET")):
+            self.assertFalse(self.report())
+        self.assertFalse(self.entry_module.report_bootstrap_failure(
+            str(self.root / ".." / self.root.name / "intent.json"), "audit", ValueError()))
+        self.assertFalse(self.report(phase="../not-a-phase"))
+        self.assertEqual(self.artifacts(), [])
+
+    def test_foreign_receipt_paths_are_not_diagnostic_targets(self):
+        self.intent["receipts"] = {"directory": "/foreign", "entry": "../outside", "returned": "/elsewhere"}
+        self.write_intent()
+        self.assertTrue(self.report())
+        self.assertEqual(len(self.artifacts()), 1)
+        self.assertEqual(len(list(self.root.iterdir())), 2)
+
+    def test_existing_diagnostic_and_receipts_are_never_overwritten(self):
+        for name in ["entry.json", "returned.json"]:
+            (self.root / name).write_bytes(b"ORIGINAL")
+        with self.patch.object(self.entry_module.os, "urandom", return_value=b"x" * 16):
+            self.assertTrue(self.report())
+            existing = self.artifacts()[0]
+            before = existing.read_bytes()
+            self.assertFalse(self.report(phase="audit"))
+        self.assertEqual(existing.read_bytes(), before)
+        self.assertEqual(len(self.artifacts()), 1)
+        for name in ["entry.json", "returned.json"]:
+            self.assertEqual((self.root / name).read_bytes(), b"ORIGINAL")
+
+    def test_public_or_hardlinked_intent_refuses(self):
+        if os.name == "nt":
+            subprocess.run(["icacls.exe", str(self.intent_path), "/grant", "*S-1-1-0:R"],
+                           check=True, capture_output=True)
+        else:
+            self.intent_path.chmod(0o644)
+        self.assertFalse(self.report())
+        self.assertEqual(self.artifacts(), [])
+
+    def test_hardlinked_intent_refuses_without_artifact(self):
+        os.link(self.intent_path, self.root / "alias.json")
+        self.assertFalse(self.report())
+        self.assertEqual(self.artifacts(), [])
+
+    def test_current_environment_binding_is_required(self):
+        with self.patch.dict(os.environ, FUSION_MCP_BOOTSTRAP_INTENT="other-intent.json"):
+            self.assertFalse(self.report())
+        self.assertEqual(self.artifacts(), [])
+
+    def test_public_inherited_child_acl_refuses_before_publication(self):
+        if os.name != "nt":
+            self.root.chmod(0o755)
+        else:
+            subprocess.run(["icacls.exe", str(self.root), "/grant", "*S-1-1-0:(OI)(CI)(IO)R"],
+                           check=True, capture_output=True)
+        self.assertFalse(self.report())
+        self.assertEqual(self.artifacts(), [])
+        self.assertFalse(list(self.root.glob(".write-*")))
+
+    def test_actual_entrypoint_and_async_consumer_faults_are_distinguished(self):
+        import ast
+        import contextlib
+        import io
+        import threading
+        import types
+        real_entry = self.entry_module.BootstrapEntry
+        for scenario in ["constructor", "schedule", "audit", "queue-timeout"]:
+            for old in self.artifacts():
+                old.unlink()
+            source = ast.parse((ROOT / "fusion_bridge/dispatch.py").read_text())
+            consumer = next(n for n in source.body if isinstance(n, ast.FunctionDef)
+                            and n.name == "_consume_bootstrap_entry")
+            test = self
+            class OfflineEntry:
+                audited = True
+                owned_autoload = True
+                before_import = real_entry.before_import
+                report_failure = real_entry.report_failure
+                def __init__(self, intent_path, _):
+                    self.intent_path = Path(intent_path)
+                    self._begun, self.entry_bytes = False, None
+                    self.returned_path = test.root / "returned.json"
+                def run_queued(self, _):
+                    raise RuntimeError("SECRET_AUDIT_MESSAGE")
+                def refuse(self, _):
+                    pass
+            def schedule(entry, context):
+                if scenario == "schedule":
+                    raise ValueError("SECRET_SCHEDULE_MESSAGE")
+                halt = threading.Event()
+                envelope = {"_bootstrap_entry": entry, "_bootstrap_context": context,
+                            "_state": "queued", "_lock": threading.Lock(), "_shutdown": halt,
+                            "_bootstrap_timer": types.SimpleNamespace(cancel=lambda: None)}
+                ports = {"__package__": self.package + ".fusion_bridge", "threading": threading,
+                         "_startup_entry": None, "_running_handlers": 0,
+                         "_lifecycle_lock": threading.Lock(), "_startup_ticket": envelope,
+                         "_halt": halt, "request_main_thread_shutdown": lambda _: None}
+                if scenario == "queue-timeout":
+                    scheduling = next(n for n in source.body if isinstance(n, ast.FunctionDef)
+                                      and n.name == "schedule_bootstrap_entry")
+                    expired = next(n for n in scheduling.body if isinstance(n, ast.FunctionDef)
+                                   and n.name == "expired")
+                    ports.update(entry=entry, envelope=envelope, shutdown=halt, _try_remove=lambda _: None)
+                    exec(compile(ast.Module(body=[expired], type_ignores=[]), "dispatch.py", "exec"), ports)
+                    ports["expired"]()
+                    return
+                exec(compile(ast.Module(body=[consumer], type_ignores=[]), "dispatch.py", "exec"), ports)
+                ports["_consume_bootstrap_entry"](envelope)
+            dispatch = types.ModuleType(self.package + ".fusion_bridge.dispatch")
+            dispatch.schedule_bootstrap_entry = schedule
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with self.patch.dict(os.environ, FUSION_MCP_BOOTSTRAP_INTENT=str(self.intent_path)), \
+                    self.patch.dict(sys.modules, {dispatch.__name__: dispatch}), \
+                    self.patch.object(self.entry_module, "BootstrapEntry",
+                                      real_entry if scenario == "constructor" else OfflineEntry), \
+                    contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                self.boot.run({"offline": True})
+            self.assertEqual(len(self.artifacts()), 1, scenario)
+            data = json.loads(self.artifacts()[0].read_text())
+            self.assertEqual(data["phase"], scenario)
+            self.assertNotIn("SECRET_", self.artifacts()[0].read_text())
+            self.assertNotIn("SECRET_", stdout.getvalue() + stderr.getvalue())
+            self.assertFalse((self.root / "entry.json").exists())
+            self.assertFalse((self.root / "returned.json").exists())
+        self.assertFalse(any(n == "adsk" or n.startswith("adsk.") for n in sys.modules))
+
+
 if __name__ == "__main__":
     unittest.main()

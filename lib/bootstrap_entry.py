@@ -14,7 +14,7 @@ import sys
 import threading
 
 from .admission_json import decode_json
-from .physical_authority import _read_private_bytes, _check_windows_acl
+from .physical_authority import _read_private_bytes, _check_windows_acl, publish_private
 from .rebaseline_fence import observe_process_birth
 from .request_admission import AdmissionError, _encode
 
@@ -96,6 +96,95 @@ def _process_image():
 def _read(path):
     _directory(path.parent)
     return _read_private_bytes(path)
+
+
+def report_bootstrap_failure(intent_path, phase, error):
+    """Best effort private facts, never a receipt, grant or historical settlement.
+
+    No output is possible before a private owned intent/current process is
+    validated, or when this module itself cannot be imported. Do not compensate
+    by trusting another path or inheriting the operator's standard handles.
+    """
+    try:
+        if phase not in ("constructor", "schedule", "audit", "queue-timeout"):
+            return False
+        intent_path = _path(str(intent_path))
+        if (os.environ.get("FUSION_MCP_BOOTSTRAP_INTENT") != str(intent_path)
+                or intent_path.name != "intent.json" or intent_path.stat().st_size > 65536):
+            return False
+        parent = _directory(intent_path.parent)
+        raw = _read(intent_path)
+        if len(raw) > 65536:
+            return False
+        intent = _exact(decode_json(raw.decode("utf-8")), (
+            "kind", "version", "nonce", "process", "purpose", "engineVersion",
+            "installed", "profile", "receipts", "executable", "mode",
+            "provision", "generation"))
+        if (intent["kind"] != "fmcad-bootstrap-entry-intent"
+                or type(intent["version"]) is not int or intent["version"] != 3
+                or intent["mode"] != "owned-autoload-v1"
+                or intent["purpose"] != "isolated-stdout-v1"
+                or type(intent["engineVersion"]) is not int or intent["engineVersion"] != 2
+                or type(intent["nonce"]) is not str
+                or re.fullmatch("[0-9a-f]{32}", intent["nonce"]) is None):
+            return False
+        process = _exact(intent["process"], ("pid", "birth"))
+        if (type(process["pid"]) is not int or process["pid"] != os.getpid()
+                or type(process["birth"]) is not str
+                or process["birth"] != observe_process_birth(os.getpid())):
+            return False
+        # Only reviewed source symbols are emitted, never arbitrary exception
+        # names, paths, source lines, messages, reprs, locals or chained errors.
+        classes = {
+            "AdmissionError", "ValueError", "TypeError", "RuntimeError",
+            "PermissionError", "FileNotFoundError", "ModuleNotFoundError",
+            "ImportError", "TimeoutError", "AttributeError", "AssertionError",
+            "KeyError", "OSError",
+        }
+        files = {
+            "AutodeskFusionMCP.py", "bootstrap_entry.py", "dispatch.py",
+            "startup_audit.py", "physical_authority.py", "admission_json.py",
+            "admission_http.py", "request_admission.py", "rebaseline_fence.py",
+        }
+        functions = {
+            "run", "__init__", "before_import", "schedule_bootstrap_entry",
+            "init_main_thread_dispatch", "_consume_bootstrap_entry", "run_queued",
+            "collect_startup_audit", "_qualify_owned_audit", "assert_current",
+            "_deny", "_path", "_read", "_directory", "_check_windows_acl",
+            "_read_private_bytes", "observe_process_birth", "validate_credentials",
+        }
+        frames = []
+        frame = error.__traceback__
+        while frame is not None and len(frames) < 16:
+            code = frame.tb_frame.f_code
+            name = Path(code.co_filename.replace("\\", "/")).name
+            frames.append({
+                "file": name if name in files else "<external>",
+                "function": code.co_name if code.co_name in functions else "<other>",
+                "line": frame.tb_lineno,
+            })
+            frame = frame.tb_next
+        data = {
+            "kind": "fmcad-bootstrap-failure-diagnostic", "version": 1,
+            "authority": "NONE", "receipt": False, "ready": False,
+            "historicalOutcome": "UNKNOWN_UNCHANGED", "phase": phase,
+            "process": process, "intentSha256": _sha(raw),
+            "exceptionClass": type(error).__name__ if type(error).__name__ in classes else "Exception",
+            "stack": frames,
+        }
+        if (_read(intent_path) != raw
+                or _directory(intent_path.parent) != parent
+                or observe_process_birth(os.getpid()) != process["birth"]):
+            return False
+        # Fixed private parent and fresh ID; no path from the intent/error is
+        # used as a publication target. Existing artifacts are never replaced.
+        output = intent_path.parent / (
+            "bootstrap-failure-" + intent["nonce"] + "-" + os.urandom(16).hex() + ".json")
+        publish_private(output, data)
+        return True
+    except BaseException:
+        # Diagnostics must not replace the original refusal or expose raw errors.
+        return False
 
 
 class BootstrapEntry:
@@ -344,6 +433,9 @@ class BootstrapEntry:
     def refuse(self, reason):
         with self._state_lock:
             self._refused = str(reason)
+
+    def report_failure(self, phase, error):
+        return report_bootstrap_failure(self.intent_path, phase, error)
 
     def begin_sdk_audit(self):
         with self._state_lock:
