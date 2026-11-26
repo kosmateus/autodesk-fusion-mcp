@@ -49,7 +49,26 @@ from audit_fixture.lib.bootstrap_entry import _process_image
 
 profile = private / "profile.json"
 profile.write_bytes(b'{"owned":"SDK-free fixture, not authority"}')
+if scenario.startswith(("profile-semantic-", "profile-legacy-format-")):
+    profile.write_text(json.dumps({
+        "loadedScripts": [{"name": "Zażółć", "path": str(package), "runOnStartup": True}],
+        "metadata": {"label": "gęślą 🧩", "number": 1},
+    }, separators=(",", ":")), encoding="utf-8")
 profile.chmod(0o600)
+
+
+def reformat_profile():
+    value = json.loads(profile.read_text(encoding="utf-8"))
+    value = dict(reversed(tuple(value.items())))
+    profile.write_bytes(json.dumps(value, indent="\t", ensure_ascii=False).replace("\n", "\r\n").encode("utf-8"))
+    events.append("profile-format-only")
+
+
+def change_profile():
+    value = json.loads(profile.read_text(encoding="utf-8"))
+    value["loadedScripts"][0]["runOnStartup"] = False
+    profile.write_text(json.dumps(value), encoding="utf-8")
+    events.append("profile-content-changed")
 intent_file = private / "intent.json"
 image = _process_image()
 provision_file = private / "provision.json"
@@ -139,8 +158,26 @@ if scenario == "bad-executable":
     intent["executable"]["sha256"] = "0" * 64
 if scenario == "noncanonical-profile-path":
     intent["profile"]["path"] = str(private) + "/profile.json"
+if scenario.startswith("profile-semantic-"):
+    value = json.loads(profile.read_text(encoding="utf-8"))
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    intent["profile"]["semanticSha256"] = sha(canonical.encode("utf-8"))
+    if scenario == "profile-semantic-bad-digest":
+        intent["profile"]["semanticSha256"] = "0" * 64
+    if scenario == "profile-semantic-malformed-digest":
+        intent["profile"]["semanticSha256"] = True
+    if scenario == "profile-semantic-extra-field":
+        intent["profile"]["skipValidation"] = True
 intent_file.write_text(json.dumps(intent))
 intent_file.chmod(0o600)
+if scenario in ("profile-semantic-before-entry", "profile-legacy-format-before-entry"):
+    reformat_profile()
+if scenario == "profile-semantic-change-before-entry":
+    change_profile()
+if scenario == "profile-semantic-duplicate-before-entry":
+    profile.write_text('{"loadedScripts":[],"loadedScripts":[]}', encoding="utf-8")
+if scenario == "profile-semantic-nonfinite-before-entry":
+    profile.write_text('{"loadedScripts":[],"number":NaN}', encoding="utf-8")
 os.environ["FUSION_MCP_BOOTSTRAP_INTENT"] = str(intent_file)
 os.environ.pop("FUSION_MCP_ADMISSION_PROVISION", None)
 if owned:
@@ -234,6 +271,10 @@ class Script:
             intent_file.write_text("{}")
         if scenario == "profile-change":
             profile.write_text("{}")
+        if scenario == "profile-semantic-during-audit":
+            reformat_profile()
+        if scenario == "profile-semantic-change-during-audit":
+            change_profile()
         if scenario == "provision-change":
             provision_file.write_text("{}")
         if scenario == "provision-env-change":
@@ -421,6 +462,10 @@ class Server:
             provision_file.write_text("{}")
         if scenario == "provision-env-before-listener":
             os.environ.pop("FUSION_MCP_ADMISSION_PROVISION", None)
+        if scenario == "profile-semantic-before-listener":
+            reformat_profile()
+        if scenario == "profile-semantic-change-before-listener":
+            change_profile()
 
     def start(self):
         entry_bytes = (private / "entry.json").read_bytes()
@@ -498,6 +543,10 @@ if dispatch is not None:
     # The real event queue is pumped ONLY by this main thread. Disable periodic
     # fake SDK signals, not the dispatcher/its _pending/_run_lock machinery.
     dispatch._scheduler_active.clear()
+    if scenario == "profile-semantic-before-event":
+        reformat_profile()
+    if scenario == "profile-semantic-change-before-event":
+        change_profile()
     if scenario == "source-before-event":
         with (package / "settings.py").open("a") as stream:
             stream.write("\n# changed before the queued audit\n")

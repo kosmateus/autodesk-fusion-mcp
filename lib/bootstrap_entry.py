@@ -45,6 +45,16 @@ def _digest(value):
     return value
 
 
+def _profile_digest(data):
+    try:
+        value = decode_json(data.decode("utf-8"))
+        if type(value) is not dict:
+            _deny()
+        return _sha(_encode(value).encode("utf-8"))
+    except (ValueError, UnicodeError, RecursionError):
+        _deny()
+
+
 def _path(value):
     path = Path(_text(value))
     if not path.is_absolute() or str(path) != value or path.resolve() != path:
@@ -141,11 +151,21 @@ class BootstrapEntry:
                     or ".." in relative.parts or "\\" in name or ":" in name):
                 _deny()
             _digest(digest)
-        profile = _exact(intent["profile"], ("path", "sha256"))
+        profile_fields = ("path", "sha256")
+        if (self.owned_autoload and type(intent["profile"]) is dict
+                and "semanticSha256" in intent["profile"]):
+            profile_fields += ("semanticSha256",)
+        profile = _exact(intent["profile"], profile_fields)
         self.profile = _path(profile["path"])
         _digest(profile["sha256"])
+        self.profile_semantic_sha256 = (
+            _digest(profile["semanticSha256"])
+            if "semanticSha256" in profile else None)
         self.profile_bytes = _read(self.profile)
-        if _sha(self.profile_bytes) != profile["sha256"]:
+        if self.profile_semantic_sha256 is not None:
+            if not self._profile_matches(self.profile_bytes):
+                _deny()
+        elif _sha(self.profile_bytes) != profile["sha256"]:
             _deny()
         self.provision = None
         self.provision_bytes = None
@@ -201,6 +221,11 @@ class BootstrapEntry:
         if os.path.lexists(self.entry_path) or os.path.lexists(self.returned_path):
             _deny()
 
+    def _profile_matches(self, data):
+        if self.profile_semantic_sha256 is not None:
+            return _profile_digest(data) == self.profile_semantic_sha256
+        return data == self.profile_bytes
+
     def assert_current(self):
         with self._state_lock:
             if self._refused is not None:
@@ -209,7 +234,7 @@ class BootstrapEntry:
         if (os.getpid() != intent["process"]["pid"]
                 or observe_process_birth(os.getpid()) != intent["process"]["birth"]
                 or _read(self.intent_path) != self.intent_bytes
-                or _read(self.profile) != self.profile_bytes
+                or not self._profile_matches(_read(self.profile))
                 or _directory(self.output) != self.output_identity):
             _deny()
         if self.audited and (

@@ -206,6 +206,49 @@ class StartupAuditTests(unittest.TestCase):
                                 facts["events"].index("vendor-utility-ui-getter"))
                 self.assertNotIn("startupAudit", returned)
 
+    def test_owned_profile_format_changes_preserve_original_intent_binding(self):
+        for phase in ("before-entry", "before-event", "during-audit", "before-listener"):
+            with self.subTest(phase=phase):
+                facts, result = self.run_fixture("owned-profile-semantic-" + phase)
+                self.assertTrue(facts["listener"], result.stdout + result.stderr)
+                self.assertEqual(facts["entry"]["profile"], facts["originalIntent"]["profile"])
+                self.assertEqual(facts["returned"]["profile"], facts["originalIntent"]["profile"])
+                self.assertEqual(facts["entry"]["intent"]["sha256"], facts["originalIntentSha256"])
+                self.assertEqual(len(facts["entry"]["profile"]["semanticSha256"]), 64)
+                self.assertIn("profile-format-only", facts["events"])
+
+    def test_owned_semantic_profile_changes_never_open_listener(self):
+        for phase in ("before-entry", "before-event", "during-audit", "before-listener"):
+            with self.subTest(phase=phase):
+                facts, result = self.run_fixture("owned-profile-semantic-change-" + phase)
+                self.assertFalse(facts["listener"], result.stdout + result.stderr)
+                if phase == "before-entry":
+                    self.assertEqual(facts["events"], ["profile-content-changed"])
+                if phase != "before-listener":
+                    self.assertIsNone(facts["entry"])
+
+    def test_semantic_profile_descriptor_and_json_remain_fail_closed(self):
+        for scenario in (
+            "bad-digest", "malformed-digest", "extra-field",
+            "duplicate-before-entry", "nonfinite-before-entry",
+        ):
+            with self.subTest(scenario=scenario):
+                facts, result = self.run_fixture("owned-profile-semantic-" + scenario)
+                self.assertFalse(facts["listener"], result.stdout + result.stderr)
+                self.assertIsNone(facts["entry"])
+                self.assertEqual(facts["events"], [])
+
+    def test_legacy_profiles_keep_raw_binding_and_v2_rejects_semantic_extension(self):
+        for scenario in (
+            "owned-profile-legacy-format-before-entry",
+            "profile-legacy-format-before-entry", "profile-semantic-before-entry",
+        ):
+            with self.subTest(scenario=scenario):
+                facts, result = self.run_fixture(scenario)
+                self.assertFalse(facts["listener"], result.stdout + result.stderr)
+                self.assertIsNone(facts["entry"])
+                self.assertFalse(any(event.startswith("getter:") for event in facts["events"]))
+
     def test_owned_v3_closed_intent_and_provision_fail_before_any_sdk(self):
         for scenario in (
             "bad-intent", "bad-executable", "bad-mode", "bad-version",
