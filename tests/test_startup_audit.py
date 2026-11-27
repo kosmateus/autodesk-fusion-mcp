@@ -238,6 +238,7 @@ class StartupAuditTests(unittest.TestCase):
                 self.assertIsNone(facts["entry"])
                 self.assertEqual(facts["events"], [])
 
+
     def test_legacy_profiles_keep_raw_binding_and_v2_rejects_semantic_extension(self):
         for scenario in (
             "owned-profile-legacy-format-before-entry",
@@ -313,3 +314,156 @@ class StartupAuditTests(unittest.TestCase):
                 self.assertEqual(facts[name], {"original": "must survive"})
                 self.assertFalse(facts["listener"], result.stdout + result.stderr)
                 self.assertEqual(facts["events"], [])
+
+
+class OwnedAuditFolderTests(unittest.TestCase):
+    """Whole qualifier on the 27-row shape captured from the real Fusion SDK.
+
+    Only filesystem roots are relocated into owned fixtures. Seven bundled
+    internal add-ins retain their actually observed running/startup state.
+    No SDK getter, application, autoloader or native process is invoked.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib
+        import types
+        package = types.ModuleType("owned_audit_folder_fixture")
+        package.__path__ = [str(ROOT)]
+        sys.modules[package.__name__] = package
+        cls.module = importlib.import_module(package.__name__ + ".lib.bootstrap_entry")
+
+    def setUp(self):
+        import hashlib
+        temporary = tempfile.TemporaryDirectory(prefix="owned-audit-folders-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.vendor = self.root / "vendor"
+        self.installed = self.root / "own"
+        self.installed.mkdir()
+        self.vendor.mkdir()
+        self.entry = self.module.BootstrapEntry.__new__(self.module.BootstrapEntry)
+        self.entry.installed = self.installed
+        self.entry.executable = self.vendor / "Fusion360.exe"
+        self.manifest = hashlib.sha256((ROOT / "AutodeskFusionMCP.manifest").read_bytes()).hexdigest()
+        self.entry.intent = {"installed": {"files": {"AutodeskFusionMCP.manifest": self.manifest}}}
+        internal = [
+            "ElectronicsPackageGenerator", "FusionBSDLGenerator",
+            "ManufacturingSustainabilityInsights", "SystemModeler",
+            "TinkercadToFusion", "parts4cad", "traceparts",
+        ]
+        sample_addins = [
+            "CPP/AddInSamples/AddInSample", "Python/AddInSamples/CAM_API_Utilities",
+            "Python/AddInSamples/CommandSample", "Python/AddInSamples/SpurGear",
+        ]
+        sample_scripts = [
+            "CPP/Samples/CustomGraphicsSample",
+            *("Python/Samples/" + name for name in [
+                "AppearanceCreation", "AutoTimeline", "Bolt", "CustomGraphicsSample",
+                "ExtractBOM", "ImportSplineCSV", "ManufacturingWorkflowAPISample", "SpurGear"]),
+            *("TypeScript/Samples/" + name for name in [
+                "AutoTimeline", "CAMParametersSample", "FetchAndFileSystemSample",
+                "ManufacturingWorkflowAPISample", "OAuthPkceSample", "SimpleExtrusionSample"]),
+        ]
+        rows = []
+        def append(folder, location, addin, startup, running):
+            folder.mkdir(parents=True, exist_ok=True)
+            rows.append({
+                "folder": folder.as_posix(),  # Actual SDK spelling on Windows.
+                "location": {"name": location},
+                "isAddIn": addin, "isRunOnStartup": startup, "isRunning": running,
+                "manifest": {"sha256": self.manifest if folder == self.installed else "0" * 64},
+            })
+        for name in internal:
+            append(self.vendor / "Api/InternalAddins" / name,
+                   "InternalScriptSourceLocation", True, True, True)
+        for name in sample_addins:
+            append(self.vendor / name, "SamplesScriptSourceLocation", True, False, False)
+        for name in sample_scripts:
+            append(self.vendor / name, "SamplesScriptSourceLocation", False, None, False)
+        append(self.installed, "UserDefinedScriptSourceLocation", True, True, True)
+        self.audit = {"scripts": {"items": rows}}
+
+    def test_full_saved_sdk_shape_allows_bundled_components_without_mutating_rows(self):
+        before = json.dumps(self.audit, sort_keys=True)
+        self.assertEqual(len(self.audit["scripts"]["items"]), 27)
+        self.entry._qualify_owned_audit(self.audit)
+        self.assertEqual(json.dumps(self.audit, sort_keys=True), before)
+
+    def test_active_foreign_rows_still_refuse(self):
+        import copy
+        foreign = self.root / "foreign"
+        foreign.mkdir()
+        for location, addin, startup, running in [
+            ("UserDefinedScriptSourceLocation", True, True, False),
+            ("UserDefinedScriptSourceLocation", True, False, True),
+            ("SamplesScriptSourceLocation", False, None, True),
+            ("InternalScriptSourceLocation", True, True, True),
+        ]:
+            audit = copy.deepcopy(self.audit)
+            audit["scripts"]["items"].append({
+                "folder": foreign.as_posix(), "location": {"name": location},
+                "isAddIn": addin, "isRunOnStartup": startup, "isRunning": running})
+            with self.subTest(location=location, running=running):
+                with self.assertRaises(self.module.AdmissionError):
+                    self.entry._qualify_owned_audit(audit)
+
+    def test_internal_classification_alone_or_vendor_path_alone_is_not_sufficient(self):
+        import copy
+        audit = copy.deepcopy(self.audit)
+        audit["scripts"]["items"][0]["location"]["name"] = "UserDefinedScriptSourceLocation"
+        with self.assertRaises(self.module.AdmissionError):
+            self.entry._qualify_owned_audit(audit)
+        original = self.entry.executable
+        self.entry.executable = self.root / "different-host" / "Fusion360.exe"
+        with self.assertRaises(self.module.AdmissionError):
+            self.entry._qualify_owned_audit(self.audit)
+        self.entry.executable = original
+
+    def test_own_source_state_and_single_own_row_remain_strict(self):
+        import copy
+        for field, value in [("isRunning", False), ("isRunOnStartup", False),
+                             ("isAddIn", False), ("manifest", {"sha256": "0" * 64})]:
+            audit = copy.deepcopy(self.audit)
+            audit["scripts"]["items"][-1][field] = value
+            with self.subTest(field=field):
+                with self.assertRaises(self.module.AdmissionError):
+                    self.entry._qualify_owned_audit(audit)
+        for rows in [self.audit["scripts"]["items"][:-1],
+                     self.audit["scripts"]["items"] + [self.audit["scripts"]["items"][-1]]]:
+            with self.assertRaises(self.module.AdmissionError):
+                self.entry._qualify_owned_audit({"scripts": {"items": rows}})
+
+    def test_observed_path_traversal_and_alias_spelling_refuse(self):
+        import copy
+        original = self.audit["scripts"]["items"][0]["folder"]
+        for value in ["relative/folder", original + "/../" + Path(original).name,
+                      original + "/", original + "/."]:
+            audit = copy.deepcopy(self.audit)
+            audit["scripts"]["items"][0]["folder"] = value
+            with self.subTest(value=value):
+                with self.assertRaises(self.module.AdmissionError):
+                    self.entry._qualify_owned_audit(audit)
+
+    def test_observed_symlink_or_windows_junction_refuses(self):
+        import copy
+        target = self.vendor / "Api/InternalAddins/ElectronicsPackageGenerator"
+        alias = target.parent / "alias"
+        if os.name == "nt":
+            subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", str(alias), str(target)],
+                           check=True, capture_output=True)
+        else:
+            alias.symlink_to(target, target_is_directory=True)
+        audit = copy.deepcopy(self.audit)
+        audit["scripts"]["items"][0]["folder"] = alias.as_posix()
+        with self.assertRaises(self.module.AdmissionError):
+            self.entry._qualify_owned_audit(audit)
+
+    def test_authority_path_validation_is_not_normalized(self):
+        self.assertEqual(self.module._path(str(self.installed)), self.installed)
+        alias = str(self.root) + os.sep + "." + os.sep + "own"
+        with self.assertRaises(self.module.AdmissionError):
+            self.module._path(alias)
+        if os.name == "nt":
+            with self.assertRaises(self.module.AdmissionError):
+                self.module._path(self.installed.as_posix())

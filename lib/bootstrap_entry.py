@@ -481,20 +481,32 @@ class BootstrapEntry:
         self.run_returned()
 
     def _qualify_owned_audit(self, audit):
-        """Only the exact pinned fork may auto-start; no JSON grants authority."""
+        """Allow the pinned fork and bundled host components, not other add-ins.
+
+        The controlled native runtime trusts Fusion and its internal components.
+        This inventory does not prove global host isolation or grant SDK work.
+        """
         own = []
         manifest = self.intent["installed"]["files"].get("AutodeskFusionMCP.manifest")
         if manifest is None:
             _deny()
 
         for row in audit["scripts"]["items"]:
-            folder = _path(row["folder"])
+            # SDK observations use forward slashes on Windows. Normalize only
+            # separators here; authority/intent paths still use strict _path.
+            folder = _path(_text(row["folder"]).replace("/", os.sep))
             if folder == self.installed:
                 if (not row["isAddIn"] or row["isRunOnStartup"] is not True
                         or row["isRunning"] is not True
                         or row["manifest"]["sha256"] != manifest):
                     _deny()
                 own.append(row)
+            elif (row["location"]["name"] == "InternalScriptSourceLocation"
+                    and self.executable.parent / "Api" / "InternalAddins" in folder.parents):
+                # Both SDK classification and canonical containment under the
+                # exact pinned executable are required. A manifest author/name
+                # or a caller-supplied "internal" label alone is not sufficient.
+                continue
             elif (row["isRunning"] is not False
                     or (row["isAddIn"] and row["isRunOnStartup"] is not False)):
                 _deny()
