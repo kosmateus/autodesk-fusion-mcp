@@ -295,8 +295,10 @@ class PhysicalTurn:
         self.binding = binding
 
     def start(self):
-        self.capability.validate()
-        self.capability._authority._store.start_physical_turn(self.binding)
+        # Token validation and the durable active turn cannot straddle rotation.
+        with self.capability._authority._lock:
+            self.capability.validate()
+            self.capability._authority._store.start_physical_turn(self.binding)
 
     def finish(self):
         self.capability._authority._store.release_physical_turn(self.binding)
@@ -337,7 +339,7 @@ class PhysicalAuthority:
             self.close()
             raise
 
-    def issue(self, descriptor, *, activation=None):
+    def issue(self, descriptor, *, activation=None, broker_namespace=None):
         if (not isinstance(descriptor, dict) or set(descriptor) != {
             "kind", "version", "handoffId", "generation", "brokerOwner",
             "endpointURL", "physicalRuntime",
@@ -356,14 +358,18 @@ class PhysicalAuthority:
         with self._lock:
             if self._lease is None or self._revoked:
                 raise AdmissionError("Physical authority is retired")
-            self._store.bind_physical_owner(descriptor, activation=activation)
-            if self._grant is None:
+            self._store.bind_physical_owner(
+                descriptor, activation=activation, broker_namespace=broker_namespace,
+            )
+            if self._grant is None or descriptor != {
+                key: value for key, value in self._grant.items() if key != "token"
+            }:
                 self._grant = copy.deepcopy(descriptor)
                 self._grant["token"] = secrets.token_urlsafe(48)
                 self._activation = copy.deepcopy(activation)
             return copy.deepcopy(self._grant)
 
-    def publish_grant(self, descriptor, output, *, activation=None):
+    def publish_grant(self, descriptor, output, *, activation=None, broker_namespace=None):
         output = Path(output)
         if not output.is_absolute():
             raise AdmissionError("An absolute private grant output is required")
@@ -383,7 +389,9 @@ class PhysicalAuthority:
                     self._grant, sort_keys=True, allow_nan=False,
                 ).encode("utf-8"):
                     raise AdmissionError("Grant output already contains another file")
-            grant = self.issue(descriptor, activation=activation)
+            grant = self.issue(
+                descriptor, activation=activation, broker_namespace=broker_namespace,
+            )
             try:
                 publish_private(output, grant)
             except FileExistsError:

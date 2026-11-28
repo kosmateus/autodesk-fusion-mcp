@@ -207,7 +207,7 @@ class AdmissionStore:
         from .rebaseline_fence_store import register_runtime
         return register_runtime(self, pins)
 
-    def bind_physical_owner(self, descriptor, *, activation=None):
+    def bind_physical_owner(self, descriptor, *, activation=None, broker_namespace=None):
         """Persist the owner binding in this same store, never another queue DB."""
         generation = _encode(descriptor["generation"])
         binding = _encode(descriptor)
@@ -236,7 +236,34 @@ class AdmissionStore:
                 "SELECT binding FROM physical_owners WHERE generation=?", (generation,),
             ).fetchone()
             if row is not None and row[0] != binding:
-                raise AdmissionError("Physical generation already belongs to another owner")
+                previous = json.loads(row[0])
+                if (any(previous[key] != descriptor[key] for key in descriptor if key != "brokerOwner")
+                        or previous["brokerOwner"]["queueDirectory"] !=
+                        descriptor["brokerOwner"]["queueDirectory"]):
+                    raise AdmissionError("Physical generation belongs to another namespace")
+                from .rebaseline_fence_store import active_head
+                fence = active_head(self)
+                if fence is None or fence[4] != "consumed":
+                    raise AdmissionError("Owner succession requires its consumed native root")
+                self._turn_schema()
+                if self._db.execute(
+                    "SELECT 1 FROM physical_turns WHERE state!='released' LIMIT 1",
+                ).fetchone() is not None:
+                    raise AdmissionError("An unreleased physical turn prevents owner succession")
+                from .physical_owner_witness import verify_owner_succession
+                root = json.loads(fence[1])["store"]
+                verify_owner_succession(
+                    previous["brokerOwner"], descriptor["brokerOwner"],
+                    realm=dict(root, keyDigest=fence[3]),
+                    broker_namespace=broker_namespace,
+                )
+                changed = self._db.execute(
+                    "UPDATE physical_owners SET binding=? WHERE generation=? AND binding=?",
+                    (binding, generation, row[0]),
+                ).rowcount
+                if changed != 1:
+                    raise AdmissionError("Physical owner succession lost its binding")
+                return
             self._db.execute("INSERT OR IGNORE INTO physical_owners VALUES (?,?)",
                              (generation, binding))
 
