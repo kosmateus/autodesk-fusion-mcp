@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sqlite3
 import sys
 import threading
 import time
@@ -247,6 +248,157 @@ threading.Event().wait(60)
         new_config = json.loads((self.host / "normal-runtime.json").read_text())
         self.assertNotEqual(new_config["descriptor"]["generation"], old_config["descriptor"]["generation"])
         self.assertEqual(new_config["descriptor"]["physicalRuntime"]["pid"], os.getpid())
+
+    def crash_start(self, stage):
+        script = """
+import sys, os, importlib
+from contextlib import contextmanager
+sys.path.insert(0,"tests")
+import _fusion_test_bootstrap
+from pathlib import Path
+from lib import physical_authority
+physical_authority.authority_directory=lambda:Path(sys.argv[1])
+from fusion_bridge import admission_runtime
+normal=importlib.import_module(admission_runtime.__package__.rsplit(".",1)[0]+".lib.normal_runtime")
+stage=sys.argv[2]
+original_store=normal.AdmissionStore
+if stage=="admissions-only":
+    @contextmanager
+    def crash_transaction(*args,**kwargs):
+        os._exit(73)
+        yield
+    original_store._transaction=crash_transaction
+def crash_store(*args,**kwargs):
+    if stage=="empty-db":
+        os._exit(73)
+    store=original_store(*args,**kwargs)
+    if stage=="initialized-db":
+        store.close()
+        os._exit(73)
+    return store
+normal.AdmissionStore=crash_store
+original_write=normal.write_private
+def crash_discovery(path,value):
+    if stage=="before-db" and Path(path).name=="normal-starting.json":
+        original_write(path,value)
+        os._exit(73)
+    if Path(path).name=="normal-runtime.json":
+        provision=physical_authority.read_private(Path(value["provisionPath"]))
+        with original_store(provision["database"],instance=provision["instance"],
+                            epoch=provision["epoch"],create=False) as store:
+            binding=dict(version=1,owner="crashed",request="bootstrap-unknown",
+                         instance=provision["instance"],epoch=provision["epoch"],
+                         source="s",build="b",document="doc",inputHash="hash")
+            store.admit(binding)
+            store.claim(binding)
+        if stage=="after-discovery":
+            original_write(path,value)
+        os._exit(73)
+    return original_write(path,value)
+if stage in ("before-db","before-discovery","after-discovery"):
+    normal.write_private=crash_discovery
+admission_runtime.AdmissionRuntime.from_environment(lambda _: None,version="unknown",
+                                                   endpoint="http://127.0.0.1:0/mcp")
+raise RuntimeError("Crash boundary was not reached")
+"""
+        child = subprocess.run(
+            [sys.executable, "-B", "-c", script, str(self.host), stage],
+            cwd=str(Path(__file__).resolve().parents[1]), capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(child.returncode, 73, child.stderr)
+
+    def test_crash_before_discovery_resumes_owned_store_without_resetting_unknown(self):
+        self.crash_start("before-discovery")
+        self.assertFalse((self.host / "normal-runtime.json").exists())
+        originals = {path: path.read_bytes() for path in (self.host / "normal-provisions").glob("*.json")}
+        self.fixture.start_runtime(broker_owner="fmcad-normal-broker")
+        self.assertEqual(runtime._admission._store._db.execute(
+            "SELECT request,state,result FROM admissions").fetchall(),
+            [("bootstrap-unknown", "claimed", None)])
+        for path, value in originals.items():
+            self.assertEqual(path.read_bytes(), value)
+
+    def test_crash_after_empty_database_creation_resumes_initialization(self):
+        self.crash_start("empty-db")
+        self.assertEqual((self.host / "normal-admissions.sqlite").stat().st_size, 0)
+        self.fixture.start_runtime(broker_owner="fmcad-normal-broker")
+        self.assertIsNotNone(runtime._admission.physical)
+
+    def test_crash_after_schema_commit_resumes_without_resetting_generation_history(self):
+        self.crash_start("initialized-db")
+        self.fixture.start_runtime(broker_owner="fmcad-normal-broker")
+        self.assertEqual(runtime._admission._store._db.execute(
+            "SELECT COUNT(*) FROM generation_history").fetchone()[0], 2)
+
+    def test_crash_after_first_schema_statement_resumes_partial_initialization(self):
+        self.crash_start("admissions-only")
+        self.fixture.start_runtime(broker_owner="fmcad-normal-broker")
+        self.assertIsNotNone(runtime._admission.physical)
+
+    def test_crashed_restart_with_old_discovery_keeps_both_unknown_records(self):
+        old = self.first_process()
+        old.terminate()
+        old.wait(timeout=5)
+        self.crash_start("before-discovery")
+        self.fixture.start_runtime(broker_owner="fmcad-normal-broker")
+        self.assertEqual(runtime._admission._store._db.execute(
+            "SELECT request,state,result FROM admissions ORDER BY request").fetchall(),
+            [("bootstrap-unknown", "claimed", None), ("original", "claimed", None)])
+
+    def test_crash_before_database_creation_resumes_only_the_owned_preparation(self):
+        self.crash_start("before-db")
+        self.assertFalse((self.host / "normal-admissions.sqlite").exists())
+        self.fixture.start_runtime(broker_owner="fmcad-normal-broker")
+        self.assertIsNotNone(runtime._admission.physical)
+
+    def test_crashed_restart_before_generation_commit_keeps_the_previous_head(self):
+        old = self.first_process()
+        old.terminate()
+        old.wait(timeout=5)
+        self.crash_start("empty-db")
+        self.fixture.start_runtime(broker_owner="fmcad-normal-broker")
+        store = runtime._admission._store
+        self.assertEqual(store._db.execute("SELECT COUNT(*) FROM generation_history").fetchone()[0], 2)
+        self.assertEqual(store._db.execute(
+            "SELECT request,state,result FROM admissions").fetchall(), [("original", "claimed", None)])
+
+    def test_crash_after_discovery_publication_is_idempotently_recovered(self):
+        self.crash_start("after-discovery")
+        self.assertTrue((self.host / "normal-runtime.json").exists())
+        self.fixture.start_runtime(broker_owner="fmcad-normal-broker")
+        self.assertEqual(runtime._admission._store._db.execute(
+            "SELECT request,state,result FROM admissions").fetchall(),
+            [("bootstrap-unknown", "claimed", None)])
+        self.assertFalse((self.host / "normal-starting.json").exists())
+
+    def test_interrupted_startup_does_not_adopt_a_changed_generation_or_settle_unknown(self):
+        self.crash_start("before-discovery")
+        database = self.host / "normal-admissions.sqlite"
+        with sqlite3.connect(database) as db:
+            db.execute("UPDATE generation SET instance='foreign',epoch='foreign'")
+            rows = db.execute("SELECT * FROM admissions").fetchall()
+        with self.assertRaises(AdmissionError):
+            admission_runtime.AdmissionRuntime.from_environment(lambda _: None)
+        with sqlite3.connect(database) as db:
+            self.assertEqual(db.execute("SELECT * FROM admissions").fetchall(), rows)
+            self.assertEqual(db.execute(
+                "SELECT instance,epoch FROM generation").fetchone(), ("foreign", "foreign"))
+        self.assertFalse((self.host / "normal-runtime.json").exists())
+        self.assertTrue((self.host / "normal-starting.json").exists())
+
+    def test_interrupted_startup_never_initializes_unrelated_existing_tables(self):
+        self.crash_start("before-db")
+        database = self.host / "normal-admissions.sqlite"
+        with sqlite3.connect(database) as db:
+            db.execute("CREATE TABLE unrelated_original (value TEXT)")
+            db.execute("INSERT INTO unrelated_original VALUES ('UNKNOWN')")
+        with self.assertRaises(AdmissionError):
+            admission_runtime.AdmissionRuntime.from_environment(lambda _: None)
+        with sqlite3.connect(database) as db:
+            self.assertEqual(db.execute("SELECT * FROM unrelated_original").fetchall(), [("UNKNOWN",)])
+            self.assertEqual(db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'").fetchall(),
+                [("unrelated_original",)])
 
 
 if __name__ == "__main__":

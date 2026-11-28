@@ -49,8 +49,9 @@ def _descriptor(provision, version, endpoint):
     )
 
 
-def _load(directory):
-    config = read_private(directory / "normal-runtime.json")
+def _load(directory, config=None):
+    if config is None:
+        config = read_private(directory / "normal-runtime.json")
     if (not isinstance(config, dict) or set(config) != {
             "kind", "version", "provisionPath", "installedForkDirectory",
             "nativePrivateDirectory", "descriptor",
@@ -106,6 +107,62 @@ def _alive(provision):
         raise AdmissionError("Previous normal native process is unobservable") from None
 
 
+def _recover_starting(directory):
+    journal = directory / "normal-starting.json"
+    try:
+        record = read_private(journal)
+    except FileNotFoundError:
+        return
+    if (not isinstance(record, dict) or set(record) != {"config", "previous"}
+            or not isinstance(record["config"], dict)):
+        raise AdmissionError("Normal native startup record changed")
+    config, provision = _load(directory, record["config"])
+    snapshot = directory / "normal-runtimes" / (provision["instance"] + ".json")
+    if read_private(snapshot) != config:
+        raise AdmissionError("Normal native startup snapshot changed")
+    if ((provision["pid"], provision["birth"]) != (os.getpid(), observe_process_birth(os.getpid()))
+            and _alive(provision)):
+        raise AdmissionError("Another normal native startup is still alive")
+    previous = None
+    if record["previous"] is not None:
+        _, previous = _load(directory, record["previous"])
+    current_file = directory / "normal-runtime.json"
+    if current_file.exists() and read_private(current_file) not in (config, record["previous"]):
+        raise AdmissionError("Normal native discovery changed during interrupted startup")
+    database = Path(provision["database"])
+    if not database.exists():
+        if previous is not None:
+            raise AdmissionError("Existing normal native database disappeared")
+        fd = os.open(database, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        os.close(fd)
+    # A crash may leave either an empty file, the first admissions table, or a
+    # committed generation. Never reset/adopt unrelated tables or a foreign head.
+    with closing(sqlite3.connect(database.as_uri() + "?mode=rw", uri=True)) as db:
+        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        generation = (db.execute("SELECT instance,epoch FROM generation WHERE singleton=1").fetchone()
+                      if "generation" in tables else None)
+        if generation is None:
+            if (previous is not None or tables - {"admissions"} or
+                    ("admissions" in tables and db.execute("SELECT 1 FROM admissions LIMIT 1").fetchone())):
+                raise AdmissionError("Normal native initialization does not own this database")
+        elif generation == (provision["instance"], provision["epoch"]):
+            pass
+        elif previous is not None and generation == (previous["instance"], previous["epoch"]):
+            # The intended transition did not commit. Keep the original
+            # projection; the ordinary start will prepare its own fresh attempt.
+            config = record["previous"]
+        else:
+            raise AdmissionError("Interrupted normal startup lost its generation")
+    if generation is None:
+        with AdmissionStore(database, instance=provision["instance"], epoch=provision["epoch"]):
+            pass
+    private_directory(directory / "clients")
+    write_private(current_file, config)
+    if read_private(journal) != record:
+        raise AdmissionError("Normal native startup record changed during recovery")
+    journal.unlink()
+
+
 def create_runtime(runtime_class, dispatch, *, shutdown=None, version="unknown",
                    endpoint="http://127.0.0.1:8765/mcp"):
     # Import only on the add-in's ordinary start, not on public discovery.
@@ -118,8 +175,11 @@ def create_runtime(runtime_class, dispatch, *, shutdown=None, version="unknown",
         database = directory / "normal-admissions.sqlite"
         config_file = directory / "normal-runtime.json"
         previous = None
+        previous_config = None
+        _recover_starting(directory)
         if config_file.exists():
             config, previous = _load(directory)
+            previous_config = config
             if (previous["pid"], previous["birth"]) == (os.getpid(), observe_process_birth(os.getpid())):
                 if (previous["source"] != source or previous["build"] != source
                         or config["descriptor"] != _descriptor(previous, version, endpoint)
@@ -139,6 +199,17 @@ def create_runtime(runtime_class, dispatch, *, shutdown=None, version="unknown",
         provisions = private_directory(directory / "normal-provisions")
         provision_path = provisions / (provision["instance"] + ".json")
         publish_private(provision_path, provision)
+        config = dict(
+            kind=KIND, version=1, provisionPath=str(provision_path),
+            installedForkDirectory=installed, nativePrivateDirectory=str(directory / "clients"),
+            descriptor=_descriptor(provision, version, endpoint),
+        )
+        snapshots = private_directory(directory / "normal-runtimes")
+        publish_private(snapshots / (provision["instance"] + ".json"), config)
+        # Durable ownership of this preparation must precede the first DB
+        # creation/change. Discovery is still published only after authority.
+        starting = directory / "normal-starting.json"
+        write_private(starting, dict(config=config, previous=previous_config))
         if previous is None:
             fd = os.open(database, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
             os.close(fd)
@@ -157,16 +228,10 @@ def create_runtime(runtime_class, dispatch, *, shutdown=None, version="unknown",
                 os.close(lease)
         private_directory(directory / "clients")
         result = runtime_class(provision, dispatch, shutdown=shutdown, version=version, endpoint=endpoint)
-        config = dict(
-            kind=KIND, version=1, provisionPath=str(provision_path),
-            installedForkDirectory=installed, nativePrivateDirectory=str(directory / "clients"),
-            descriptor=_descriptor(provision, version, endpoint),
-        )
         # Preserve each process's original configuration; only the discovery
         # projection changes. No original provision, receipt or history is reset.
-        snapshots = private_directory(directory / "normal-runtimes")
-        publish_private(snapshots / (provision["instance"] + ".json"), config)
         write_private(config_file, config)
+        starting.unlink()
         return result
     except BaseException:
         if result is not None:
