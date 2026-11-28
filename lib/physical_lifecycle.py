@@ -3,6 +3,7 @@
 import argparse
 from contextlib import closing
 import json
+import os
 from pathlib import Path
 import secrets
 import sqlite3
@@ -52,6 +53,7 @@ class LifecycleMailbox:
                     output = Path(envelope["output"])
                     grant = self.authority.publish_grant(
                         request, output, activation=envelope.get("activation"),
+                        broker_namespace=envelope.get("brokerNamespace"),
                     )
                     result = dict(state="granted", handoffId=grant["handoffId"])
                 elif operation == "handoff":
@@ -114,6 +116,8 @@ def main(argv=None):
         if not output.is_absolute():
             parser.error("--output must be absolute")
         envelope["output"] = str(output)
+        if os.environ.get("WSL_DISTRO_NAME"):
+            envelope["brokerNamespace"] = os.environ["WSL_DISTRO_NAME"]
         if args.activation is not None:
             envelope["activation"] = read_private(Path(args.activation))
     directory = private_directory(authority_directory() / "mailbox")
