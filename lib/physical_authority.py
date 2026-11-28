@@ -307,6 +307,39 @@ class PhysicalTurn:
         self.capability._authority._store.release_physical_turn(self.binding, queued_only=True)
 
 
+class NormalRuntimeOrigin:
+    """Private startup composition, never decoded from a grant request."""
+
+    def __init__(self, store, config):
+        self._store = store
+        self._config = copy.deepcopy(config)
+        self._identity = store._file_identity
+
+    def assert_valid(self, store, descriptor):
+        from .normal_runtime import _load, _source
+        from .rebaseline_fence import observe_process_birth
+        if store is not self._store or store._path is None:
+            raise AdmissionError("Foreign normal runtime origin")
+        directory = store._path.parent
+        info = store._path.stat()
+        if (directory != authority_directory().resolve()
+                or store._path.name != "normal-admissions.sqlite"
+                or (info.st_dev, info.st_ino) != self._identity):
+            raise AdmissionError("Normal runtime origin database changed")
+        config, provision = _load(directory)
+        installed, source = _source()
+        snapshot = directory / "normal-runtimes" / (provision["instance"] + ".json")
+        if (config != self._config or read_private(snapshot) != config
+                or config["installedForkDirectory"] != installed
+                or config["nativePrivateDirectory"] != str(directory.parent / "clients")
+                or provision["source"] != source or provision["build"] != source
+                or provision["pid"] != os.getpid()
+                or provision["birth"] != observe_process_birth(os.getpid())
+                or config["descriptor"] != {key: descriptor[key] for key in (
+                    "handoffId", "generation", "endpointURL", "physicalRuntime")}):
+            raise AdmissionError("Normal runtime origin pins changed")
+
+
 class PhysicalAuthority:
     def __init__(self, provision, store, acquire_lease, *, version, endpoint):
         self._lock = threading.RLock()
@@ -314,6 +347,7 @@ class PhysicalAuthority:
         self._store = store
         self._grant = None
         self._activation = None
+        self._normal_origin = None
         self._revoked = False
         self.directory = private_directory(authority_directory())
         self.database = Path(provision["database"]).resolve()
@@ -339,6 +373,13 @@ class PhysicalAuthority:
             self.close()
             raise
 
+    def bind_normal_origin(self, origin):
+        with self._lock:
+            if (type(origin) is not NormalRuntimeOrigin or origin._store is not self._store
+                    or self._normal_origin is not None or self._grant is not None):
+                raise AdmissionError("Exact normal startup origin required")
+            self._normal_origin = origin
+
     def issue(self, descriptor, *, activation=None, broker_namespace=None):
         if (not isinstance(descriptor, dict) or set(descriptor) != {
             "kind", "version", "handoffId", "generation", "brokerOwner",
@@ -360,6 +401,7 @@ class PhysicalAuthority:
                 raise AdmissionError("Physical authority is retired")
             self._store.bind_physical_owner(
                 descriptor, activation=activation, broker_namespace=broker_namespace,
+                normal_origin=self._normal_origin,
             )
             if self._grant is None or descriptor != {
                 key: value for key, value in self._grant.items() if key != "token"

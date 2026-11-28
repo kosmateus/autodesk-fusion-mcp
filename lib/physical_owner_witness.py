@@ -62,62 +62,82 @@ def birth(pid):
 
 def verify():
     request = json.load(sys.stdin)
-    previous, successor, realm = request["previous"], request["successor"], request["realm"]
+    previous, successor = request["previous"], request["successor"]
+    normal = "namespace" in request
+    realm = None if normal else request["realm"]
     path = successor["queueDirectory"]
-    assert path == previous["queueDirectory"] == realm["path"] == os.path.realpath(path)
+    assert path == os.path.realpath(path)
+    if previous is not None:
+        assert path == previous["queueDirectory"]
+    if not normal:
+        assert path == realm["path"]
     root = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK)
     realm_fd = None
     try:
         original = private(os.fstat(root), True)
-        assert (original.st_dev, original.st_ino) == (realm["device"], realm["inode"])
-        realm_fd = os.open("runtime-verification", os.O_RDONLY | os.O_DIRECTORY |
-                           os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=root)
-        realm_info = private(os.fstat(realm_fd), True)
-        key = read(realm_fd, "verification.key", 32)
-        assert len(key) == 32
-        digest = hashlib.sha256(key).hexdigest()
-        assert digest == realm["keyDigest"]
-        metadata = decode(read(realm_fd, "realm.json", 512))
-        assert type(metadata["version"]) is int
-        assert metadata == dict(
-            kind="fmcad-runtime-verification-realm", version=1,
-            keyId="fmcad-rebaseline-" + digest, sha256=digest)
+        if not normal:
+            assert (original.st_dev, original.st_ino) == (realm["device"], realm["inode"])
+            realm_fd = os.open("runtime-verification", os.O_RDONLY | os.O_DIRECTORY |
+                               os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=root)
+            realm_info = private(os.fstat(realm_fd), True)
+            key = read(realm_fd, "verification.key", 32)
+            assert len(key) == 32
+            digest = hashlib.sha256(key).hexdigest()
+            assert digest == realm["keyDigest"]
+            metadata = decode(read(realm_fd, "realm.json", 512))
+            assert type(metadata["version"]) is int
+            assert metadata == dict(
+                kind="fmcad-runtime-verification-realm", version=1,
+                keyId="fmcad-rebaseline-" + digest, sha256=digest)
         expected = {name: successor[name] for name in ("pid", "birth", "nonce")}
         expected["protocol"] = 2
         claim = decode(read(root, "broker.lock", 4096))
         assert type(claim["pid"]) is int and type(claim["protocol"]) is int
         assert claim == expected
-        assert birth(previous["pid"]) != previous["birth"]
+        if previous is not None:
+            assert birth(previous["pid"]) != previous["birth"]
         assert birth(successor["pid"]) == successor["birth"]
         assert os.stat("/proc/%d" % successor["pid"]).st_uid == os.getuid()
+        observed = None
+        if normal:
+            spaces = {}
+            for name in ("pid", "mnt"):
+                own = os.stat("/proc/self/ns/" + name)
+                broker = os.stat("/proc/%d/ns/%s" % (successor["pid"], name))
+                assert (own.st_dev, own.st_ino) == (broker.st_dev, broker.st_ino)
+                spaces[name] = [own.st_dev, own.st_ino]
+            with open("/proc/sys/kernel/random/boot_id") as stream:
+                boot = stream.read().strip()
+            observed = dict(path=path, device=original.st_dev, inode=original.st_ino,
+                            uid=os.getuid(), bootId=boot, spaces=spaces)
+            if request["namespace"] is not None:
+                assert observed == request["namespace"]
         # Repeat after all reads: a delayed mailbox request cannot select a
         # replacement claim or an old PID recycled while verifying the realm.
         assert decode(read(root, "broker.lock", 4096)) == expected
-        assert birth(previous["pid"]) != previous["birth"]
+        if previous is not None:
+            assert birth(previous["pid"]) != previous["birth"]
         assert birth(successor["pid"]) == successor["birth"]
-        assert identity(os.stat("runtime-verification", dir_fd=root,
-                                follow_symlinks=False)) == identity(realm_info)
+        if not normal:
+            assert identity(os.stat("runtime-verification", dir_fd=root,
+                                    follow_symlinks=False)) == identity(realm_info)
         assert identity(os.lstat(path)) == identity(original)
         assert os.path.realpath("/proc/self/fd/%d" % root) == path
+        return observed
     finally:
         if realm_fd is not None:
             os.close(realm_fd)
         os.close(root)
 
 try:
-    verify()
+    observed = verify()
 except Exception:
     sys.exit(1)
-print("verified")
+print("verified" if observed is None else json.dumps(observed, sort_keys=True))
 '''
 
 
-def verify_owner_succession(previous, successor, *, realm, broker_namespace=None):
-    """Observe now, while the authority lock and owner-write transaction are held.
-
-    The namespace hint is private mailbox routing, never evidence. The existing
-    consumed root's device/inode and verifier digest authenticate what it opens.
-    """
+def _invoke(payload, broker_namespace):
     if sys.platform == "win32":
         if (not isinstance(broker_namespace, str) or not broker_namespace
                 or len(broker_namespace) > 256 or not broker_namespace.isascii()
@@ -135,11 +155,41 @@ def verify_owner_succession(previous, successor, *, realm, broker_namespace=None
     try:
         result = subprocess.run(
             command + ["-I", "-S", "-B", "-c", LINUX_WITNESS],
-            input=json.dumps(dict(previous=previous, successor=successor, realm=realm)),
+            input=json.dumps(payload),
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
             timeout=10, check=False,
         )
     except (OSError, subprocess.SubprocessError):
         raise AdmissionError("Broker kernel observation is unavailable") from None
-    if result.returncode != 0 or result.stdout != "verified\n":
+    if result.returncode != 0:
         raise AdmissionError("Broker owner succession is not kernel-proven")
+    return result.stdout
+
+
+def verify_owner_succession(previous, successor, *, realm, broker_namespace=None):
+    """The consumed-root path always requires its pinned existing realm key."""
+    result = _invoke(dict(previous=previous, successor=successor, realm=realm), broker_namespace)
+    if result != "verified\n":
+        raise AdmissionError("Broker owner succession is not kernel-proven")
+
+
+def observe_normal_owner(previous, successor, *, expected=None, broker_namespace=None):
+    """Selected only by authenticated NormalRuntimeOrigin, never by request flags."""
+    route = broker_namespace if sys.platform == "win32" else None
+    if expected is not None and (
+            not isinstance(expected, dict) or set(expected) != {"route", "kernel"}
+            or expected["route"] != route):
+        raise AdmissionError("Normal broker namespace routing changed")
+    result = _invoke(dict(
+        previous=previous, successor=successor,
+        namespace=None if expected is None else expected["kernel"],
+    ), broker_namespace)
+    try:
+        kernel = json.loads(result)
+        if (not isinstance(kernel, dict) or set(kernel) != {
+                "path", "device", "inode", "uid", "bootId", "spaces",
+        } or kernel["path"] != successor["queueDirectory"]):
+            raise ValueError()
+    except (ValueError, TypeError):
+        raise AdmissionError("Normal broker kernel observation is invalid") from None
+    return dict(route=route, kernel=kernel)

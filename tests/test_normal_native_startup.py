@@ -21,8 +21,8 @@ import test_admission_runtime as runtime_fixtures
 import _physical_test_support as physical_fixtures
 
 
-@unittest.skipUnless(sys.platform.startswith("linux") or sys.platform == "win32",
-                     "Provisioned native admission supports Linux and Windows")
+@unittest.skipUnless(sys.platform.startswith("linux"),
+                     "Local broker fixtures use Linux; Windows requires the separate WSL fixture")
 class NormalNativeStartupTests(unittest.TestCase):
     def setUp(self):
         f = self.fixture = runtime_fixtures.RuntimeAdmissionContracts()
@@ -42,6 +42,14 @@ class NormalNativeStartupTests(unittest.TestCase):
             profile = self.host / "normal-runtime.json"
             if profile.exists():
                 result["handoffId"] = json.loads(profile.read_text())["descriptor"]["handoffId"]
+            queue = physical_authority.private_directory(self.root / "broker-queue")
+            result["brokerOwner"].update(
+                pid=os.getpid(), birth=admission_runtime.process_birth(),
+                nonce="normal-test-claim", queueDirectory=str(queue),
+            )
+            physical_authority.write_private(queue / "broker.lock", {
+                key: result["brokerOwner"][key] for key in ("pid", "birth", "nonce")
+            } | dict(protocol=2))
             return result
 
         self.enterContext(patch.object(physical_fixtures, "descriptor", descriptor))
@@ -128,10 +136,14 @@ raise SystemExit(code)
             authority.authenticate([])
         config = normal_runtime.discover()
         request = dict(kind="fmcad-physical-grant", version=1, **config["descriptor"])
+        queue = physical_authority.private_directory(self.root / "broker-queue")
         request["brokerOwner"] = dict(
             pid=os.getpid(), birth=admission_runtime.process_birth(), nonce="current-broker",
-            clientId="fmcad-normal-broker", queueDirectory=str(self.root),
+            clientId="fmcad-normal-broker", queueDirectory=str(queue),
         )
+        physical_authority.write_private(queue / "broker.lock", {
+            key: request["brokerOwner"][key] for key in ("pid", "birth", "nonce")
+        } | dict(protocol=2))
         attempt = physical_authority.private_directory(
             Path(config["nativePrivateDirectory"]) / str(uuid.uuid4()))
         source, output = attempt / "request.json", attempt / "grant.json"

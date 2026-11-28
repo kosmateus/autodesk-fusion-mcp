@@ -10,7 +10,9 @@ import sqlite3
 import sys
 
 from . import physical_authority
-from .physical_authority import private_directory, read_private, publish_private, write_private
+from .physical_authority import (
+    NormalRuntimeOrigin, private_directory, read_private, publish_private, write_private,
+)
 from .request_admission import AdmissionError, AdmissionStore
 from .rebaseline_fence import observe_process_birth
 
@@ -193,7 +195,9 @@ def create_runtime(runtime_class, dispatch, *, shutdown=None, version="unknown",
                         or config["installedForkDirectory"] != installed
                         or config["nativePrivateDirectory"] != str(directory.parent / "clients")):
                     raise AdmissionError("Running normal native source or endpoint changed")
-                return runtime_class(previous, dispatch, shutdown=shutdown, version=version, endpoint=endpoint)
+                result = runtime_class(previous, dispatch, shutdown=shutdown, version=version, endpoint=endpoint)
+                result.physical.bind_normal_origin(NormalRuntimeOrigin(result._store, config))
+                return result
             if _alive(previous):
                 raise AdmissionError("Another normal native runtime is still alive")
         elif database.exists():
@@ -236,6 +240,7 @@ def create_runtime(runtime_class, dispatch, *, shutdown=None, version="unknown",
                 os.close(lease)
         private_directory(directory.parent / "clients")
         result = runtime_class(provision, dispatch, shutdown=shutdown, version=version, endpoint=endpoint)
+        result.physical.bind_normal_origin(NormalRuntimeOrigin(result._store, config))
         # Preserve each process's original configuration; only the discovery
         # projection changes. No original provision, receipt or history is reset.
         write_private(config_file, config)
