@@ -82,6 +82,11 @@ class BrokerOwnerSuccessionTests(unittest.TestCase):
         f.store._db.execute("UPDATE admissions SET state='claimed',claim='lost'")
         before = list(f.store._db.execute("SELECT * FROM admissions"))
         root_before = list(f.store._db.execute("SELECT * FROM provision_fences"))
+        completed = self.capability.prepare_turn("previous-released-turn", "document")
+        completed.start()
+        completed.finish()
+        history_before = f.authority.turn_history(completed.binding)
+        turns_before = list(f.store._db.execute("SELECT * FROM physical_turns"))
         self.reap_old()
         fresh = self.issue()
         self.assertEqual(fresh["brokerOwner"], self.next["brokerOwner"])
@@ -92,6 +97,8 @@ class BrokerOwnerSuccessionTests(unittest.TestCase):
         f.authority.authenticate([fresh["token"]]).validate()
         self.assertEqual(list(f.store._db.execute("SELECT * FROM admissions")), before)
         self.assertEqual(list(f.store._db.execute("SELECT * FROM provision_fences")), root_before)
+        self.assertEqual(list(f.store._db.execute("SELECT * FROM physical_turns")), turns_before)
+        self.assertEqual(f.authority.turn_history(completed.binding), history_before)
 
     def test_live_predecessor_cannot_be_overwritten(self):
         with self.assertRaises(AdmissionError):
