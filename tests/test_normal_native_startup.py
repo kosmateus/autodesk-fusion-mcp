@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import unittest
+import uuid
 from unittest.mock import patch
 
 from fusion_bridge import runtime, admission_runtime
@@ -131,7 +132,9 @@ raise SystemExit(code)
             pid=os.getpid(), birth=admission_runtime.process_birth(), nonce="current-broker",
             clientId="fmcad-normal-broker", queueDirectory=str(self.root),
         )
-        source, output = self.root / "grant-request.json", self.root / "physical-grant.json"
+        attempt = physical_authority.private_directory(
+            Path(config["nativePrivateDirectory"]) / str(uuid.uuid4()))
+        source, output = attempt / "request.json", attempt / "grant.json"
         physical_authority.write_private(source, request)
         script = """
 import sys
@@ -153,11 +156,15 @@ raise SystemExit(physical_lifecycle.main(["grant","--request",sys.argv[2],"--out
                 handler.notify(None)
                 threading.Event().wait(0.01)
             stdout, stderr = child.communicate(timeout=2)
-            self.assertEqual(child.returncode, 0, stderr)
+            self.assertEqual(child.returncode, 0, stdout + stderr)
             self.assertEqual(json.loads(stdout)["state"], "granted")
             grant = physical_authority.read_private(output)
             authority.authenticate([grant["token"]]).validate()
             self.assertNotIn(grant["token"], stdout + stderr)
+            self.assertEqual(Path(config["nativePrivateDirectory"]), self.host.parent / "clients")
+            with self.assertRaises(AdmissionError):
+                authority.publish_grant(request, self.host / "must-remain-protected.json")
+            self.assertFalse((self.host / "must-remain-protected.json").exists())
         finally:
             if child.poll() is None:
                 child.kill()
@@ -248,6 +255,50 @@ threading.Event().wait(60)
         new_config = json.loads((self.host / "normal-runtime.json").read_text())
         self.assertNotEqual(new_config["descriptor"]["generation"], old_config["descriptor"]["generation"])
         self.assertEqual(new_config["descriptor"]["physicalRuntime"]["pid"], os.getpid())
+
+    def test_normal_restart_upgrades_old_output_namespace_without_resetting_history(self):
+        child = self.first_process()
+        profile = self.host / "normal-runtime.json"
+        old = json.loads(profile.read_text())
+        old["nativePrivateDirectory"] = str(self.host / "clients")
+        physical_authority.write_private(profile, old)
+        provision = physical_authority.read_private(Path(old["provisionPath"]))
+        original_provision = Path(old["provisionPath"]).read_bytes()
+        database = Path(provision["database"])
+        identity = (database.stat().st_dev, database.stat().st_ino)
+        snapshot = self.host / "normal-runtimes" / (provision["instance"] + ".json")
+        # Fixture for the original 51a0dd91 projection, not a runtime rewrite.
+        physical_authority.write_private(snapshot, old)
+        original = snapshot.read_bytes()
+        with self.assertRaises(AdmissionError):
+            normal_runtime.discover()
+        with self.assertRaises(AdmissionError):
+            admission_runtime.AdmissionRuntime.from_environment(lambda _: None)
+        child.terminate()
+        child.wait(timeout=5)
+        self.fixture.start_runtime(broker_owner="fmcad-normal-broker")
+        current = normal_runtime.discover()
+        self.assertEqual(Path(current["nativePrivateDirectory"]), self.host.parent / "clients")
+        self.assertEqual(snapshot.read_bytes(), original)
+        self.assertEqual(Path(old["provisionPath"]).read_bytes(), original_provision)
+        self.assertEqual((database.stat().st_dev, database.stat().st_ino), identity)
+        self.assertEqual(runtime._admission._store._db.execute(
+            "SELECT request,state,result FROM admissions").fetchall(), [("original", "claimed", None)])
+
+    def test_legacy_output_namespace_requires_its_own_unchanged_snapshot(self):
+        child = self.first_process()
+        profile = self.host / "normal-runtime.json"
+        config = json.loads(profile.read_text())
+        config["nativePrivateDirectory"] = str(self.host / "clients")
+        physical_authority.write_private(profile, config)
+        child.terminate()
+        child.wait(timeout=5)
+        with self.assertRaises(AdmissionError):
+            admission_runtime.AdmissionRuntime.from_environment(lambda _: None)
+        self.assertEqual(json.loads(profile.read_text()), config)
+        with sqlite3.connect(self.host / "normal-admissions.sqlite") as db:
+            self.assertEqual(db.execute(
+                "SELECT request,state,result FROM admissions").fetchall(), [("original", "claimed", None)])
 
     def crash_start(self, stage):
         script = """

@@ -69,8 +69,15 @@ def _load(directory, config=None):
     runtime = config["descriptor"]["physicalRuntime"]
     if config["descriptor"] != _descriptor(provision, runtime["version"], config["descriptor"]["endpointURL"]):
         raise AdmissionError("Normal native discovery pins changed")
-    if config["nativePrivateDirectory"] != str(directory / "clients"):
+    # Read historical v1 snapshots across an ordinary process restart. Discovery
+    # and all newly created configurations accept only the usable sibling path.
+    if config["nativePrivateDirectory"] not in (
+            str(directory.parent / "clients"), str(directory / "clients")):
         raise AdmissionError("Normal native client namespace changed")
+    if config["nativePrivateDirectory"] == str(directory / "clients"):
+        snapshot = directory / "normal-runtimes" / (provision["instance"] + ".json")
+        if read_private(snapshot) != config:
+            raise AdmissionError("Historical normal native client namespace is unproven")
     return config, provision
 
 
@@ -156,7 +163,7 @@ def _recover_starting(directory):
     if generation is None:
         with AdmissionStore(database, instance=provision["instance"], epoch=provision["epoch"]):
             pass
-    private_directory(directory / "clients")
+    private_directory(directory.parent / "clients")
     write_private(current_file, config)
     if read_private(journal) != record:
         raise AdmissionError("Normal native startup record changed during recovery")
@@ -183,7 +190,8 @@ def create_runtime(runtime_class, dispatch, *, shutdown=None, version="unknown",
             if (previous["pid"], previous["birth"]) == (os.getpid(), observe_process_birth(os.getpid())):
                 if (previous["source"] != source or previous["build"] != source
                         or config["descriptor"] != _descriptor(previous, version, endpoint)
-                        or config["installedForkDirectory"] != installed):
+                        or config["installedForkDirectory"] != installed
+                        or config["nativePrivateDirectory"] != str(directory.parent / "clients")):
                     raise AdmissionError("Running normal native source or endpoint changed")
                 return runtime_class(previous, dispatch, shutdown=shutdown, version=version, endpoint=endpoint)
             if _alive(previous):
@@ -201,7 +209,7 @@ def create_runtime(runtime_class, dispatch, *, shutdown=None, version="unknown",
         publish_private(provision_path, provision)
         config = dict(
             kind=KIND, version=1, provisionPath=str(provision_path),
-            installedForkDirectory=installed, nativePrivateDirectory=str(directory / "clients"),
+            installedForkDirectory=installed, nativePrivateDirectory=str(directory.parent / "clients"),
             descriptor=_descriptor(provision, version, endpoint),
         )
         snapshots = private_directory(directory / "normal-runtimes")
@@ -226,7 +234,7 @@ def create_runtime(runtime_class, dispatch, *, shutdown=None, version="unknown",
                                              handoff_id=_handoff(provision))
             finally:
                 os.close(lease)
-        private_directory(directory / "clients")
+        private_directory(directory.parent / "clients")
         result = runtime_class(provision, dispatch, shutdown=shutdown, version=version, endpoint=endpoint)
         # Preserve each process's original configuration; only the discovery
         # projection changes. No original provision, receipt or history is reset.
@@ -244,6 +252,8 @@ def create_runtime(runtime_class, dispatch, *, shutdown=None, version="unknown",
 def discover():
     directory = physical_authority.authority_directory().resolve()
     config, provision = _load(directory)
+    if config["nativePrivateDirectory"] != str(directory.parent / "clients"):
+        raise AdmissionError("Normal native client output namespace requires restart")
     installed, source = _source()
     if (not _alive(provision) or config["installedForkDirectory"] != installed
             or provision["source"] != source or provision["build"] != source):
