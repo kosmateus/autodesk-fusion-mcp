@@ -207,14 +207,16 @@ class AdmissionStore:
         from .rebaseline_fence_store import register_runtime
         return register_runtime(self, pins)
 
-    def bind_physical_owner(self, descriptor, *, activation=None, broker_namespace=None):
+    def bind_physical_owner(self, descriptor, *, activation=None, broker_namespace=None,
+                            normal_origin=None):
         """Persist the owner binding in this same store, never another queue DB."""
         generation = _encode(descriptor["generation"])
         binding = _encode(descriptor)
         with self._transaction():
             self.assert_current_generation()
-            from .rebaseline_fence_store import assert_activation
+            from .rebaseline_fence_store import assert_activation, active_head
             assert_activation(self, activation, descriptor=descriptor)
+            fence = active_head(self)
             if self._db.execute("SELECT COUNT(*) FROM generation_history").fetchone()[0] > 1:
                 self._db.execute("""
                     CREATE TABLE IF NOT EXISTS physical_handoffs (
@@ -235,14 +237,19 @@ class AdmissionStore:
             row = self._db.execute(
                 "SELECT binding FROM physical_owners WHERE generation=?", (generation,),
             ).fetchone()
+            if normal_origin is not None and fence is None:
+                from .physical_authority import NormalRuntimeOrigin
+                if type(normal_origin) is not NormalRuntimeOrigin:
+                    raise AdmissionError("Exact normal startup origin required")
+                normal_origin.assert_valid(self, descriptor)
+                self._bind_normal_owner(descriptor, row, generation, binding, broker_namespace)
+                return
             if row is not None and row[0] != binding:
                 previous = json.loads(row[0])
                 if (any(previous[key] != descriptor[key] for key in descriptor if key != "brokerOwner")
                         or previous["brokerOwner"]["queueDirectory"] !=
                         descriptor["brokerOwner"]["queueDirectory"]):
                     raise AdmissionError("Physical generation belongs to another namespace")
-                from .rebaseline_fence_store import active_head
-                fence = active_head(self)
                 if fence is None or fence[4] != "consumed":
                     raise AdmissionError("Owner succession requires its consumed native root")
                 self._turn_schema()
@@ -264,8 +271,51 @@ class AdmissionStore:
                 if changed != 1:
                     raise AdmissionError("Physical owner succession lost its binding")
                 return
-            self._db.execute("INSERT OR IGNORE INTO physical_owners VALUES (?,?)",
+            self._db.execute("INSERT OR IGNORE INTO physical_owners(generation,binding) VALUES (?,?)",
                              (generation, binding))
+
+    def _bind_normal_owner(self, descriptor, row, generation, binding, broker_namespace):
+        # Persist the first actual kernel namespace beside its existing owner.
+        # No new caller proof, public DTO or independently writable registry.
+        if row is None or row[0] != binding:
+            self._turn_schema()
+            if self._db.execute(
+                "SELECT 1 FROM physical_turns WHERE state!='released' LIMIT 1",
+            ).fetchone() is not None:
+                raise AdmissionError("An unreleased physical turn prevents owner succession")
+        if "normal_namespace" not in {value[1] for value in self._db.execute(
+                "PRAGMA table_info(physical_owners)")}:
+            self._db.execute("ALTER TABLE physical_owners ADD COLUMN normal_namespace TEXT")
+        expected, previous = None, None
+        if row is not None:
+            raw = self._db.execute(
+                "SELECT normal_namespace FROM physical_owners WHERE generation=?", (generation,),
+            ).fetchone()[0]
+            if raw is None:
+                raise AdmissionError("Normal namespace requires its original kernel-bound grant")
+            expected = json.loads(raw)
+            if row[0] != binding:
+                old = json.loads(row[0])
+                if (any(old[key] != descriptor[key] for key in descriptor if key != "brokerOwner")
+                        or old["brokerOwner"]["queueDirectory"] != descriptor["brokerOwner"]["queueDirectory"]):
+                    raise AdmissionError("Physical generation belongs to another namespace")
+                previous = old["brokerOwner"]
+        from .physical_owner_witness import observe_normal_owner
+        observed = observe_normal_owner(
+            previous, descriptor["brokerOwner"], expected=expected, broker_namespace=broker_namespace,
+        )
+        if row is None:
+            self._db.execute(
+                "INSERT INTO physical_owners(generation,binding,normal_namespace) VALUES (?,?,?)",
+                (generation, binding, _encode(observed)),
+            )
+        elif row[0] != binding:
+            changed = self._db.execute(
+                "UPDATE physical_owners SET binding=? WHERE generation=? AND binding=?",
+                (binding, generation, row[0]),
+            ).rowcount
+            if changed != 1:
+                raise AdmissionError("Normal owner succession lost its binding")
 
     def _turn_schema(self):
         self._db.execute("""
