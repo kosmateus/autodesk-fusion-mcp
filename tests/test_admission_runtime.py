@@ -370,8 +370,11 @@ class RuntimeAdmissionContracts(unittest.TestCase):
         target, read_name = self.document()
         self.app.documents = [target]
         binding, encoded = self.payload()
-        with (patch.object(addon_runtime.commands, "stop") as commands_stop,
+        # This fixture starts the bridge directly; supply the command lifecycle
+        # that an ordinary addon_runtime.run() would have loaded lazily.
+        with (patch.object(addon_runtime, "commands", Mock()) as commands,
               patch.object(addon_runtime.futil, "clear_handlers") as clear_handlers):
+            commands_stop = commands.stop
             def read_while_stopping():
                 addon_runtime.stop(None)
                 self.assertIsNotNone(runtime._server)
