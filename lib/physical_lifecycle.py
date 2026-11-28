@@ -104,7 +104,18 @@ def main(argv=None):
     query = commands.add_parser("query")
     query.add_argument("--database", required=True)
     query.add_argument("--handoff-id", required=True)
+    commands.add_parser("discover")
     args = parser.parse_args(argv)
+    if args.operation == "discover":
+        from .normal_runtime import discover
+        try:
+            print(json.dumps(discover()))
+            return 0
+        except Exception:
+            # Discovery is public and SDK-free; never echo private config,
+            # database details, credentials or raw filesystem/JSON failures.
+            print(json.dumps(dict(state="unavailable", error="Normal native runtime is unavailable")))
+            return 1
     if args.operation == "query":
         result = query_handoff(args.database, args.handoff_id)
         print(json.dumps(result if result is not None else dict(state="not_found")))

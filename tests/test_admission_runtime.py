@@ -166,12 +166,7 @@ class RuntimeAdmissionContracts(unittest.TestCase):
         with closing(sqlite3.connect(self.database)) as db:
             return db.execute("SELECT instance, epoch FROM generation").fetchone()
 
-    def test_disabled_and_invalid_provision_do_not_create_admission_database(self):
-        with patch.dict(os.environ):
-            os.environ.pop("FUSION_MCP_ADMISSION_PROVISION")
-            self.start_runtime()
-            self.assertEqual(self.call("status", self.payload()[0])[0], 404)
-            self.assertTrue(runtime.stop())
+    def test_invalid_explicit_provision_never_falls_back_to_a_normal_admission_database(self):
         self.provision["birth"] = "stale"
         self.write_provision()
         self.assert_invalid_start()
@@ -179,6 +174,7 @@ class RuntimeAdmissionContracts(unittest.TestCase):
         self.write_provision()
         self.assert_invalid_start()
         self.assertFalse(self.database.exists())
+        self.assertFalse((self.file.parent / "physical" / "normal-admissions.sqlite").exists())
         self.provision["credentials"] = {self.token: "owner"}
         self.write_provision()
         self.assert_invalid_start()

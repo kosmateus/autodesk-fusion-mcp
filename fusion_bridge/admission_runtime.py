@@ -95,7 +95,8 @@ class AdmissionRuntime:
     def from_environment(cls, dispatch, *, shutdown=None, **kwargs):
         path = os.environ.get("FUSION_MCP_ADMISSION_PROVISION")
         if path is None:
-            return None
+            from ..lib.normal_runtime import create_runtime
+            return create_runtime(cls, dispatch, shutdown=shutdown, **kwargs)
         provision_path = Path(path)
         if not provision_path.is_absolute():
             raise AdmissionError("Admission provision must use an absolute local path")
